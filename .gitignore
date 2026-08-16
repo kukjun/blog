@@ -4,6 +4,10 @@ dist/
 .astro/
 # deps
 node_modules/
+# cloudflare worker
+worker/node_modules/
+.wrangler/
+.dev.vars
 # env
 .env
 .env.production

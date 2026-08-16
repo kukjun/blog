@@ -1,0 +1,53 @@
+---
+// giscus: GitHub Discussions 기반 댓글 + GitHub 로그인(SSO) + 👍 리액션(좋아요).
+// 설정값은 giscus.app에서 생성 / GraphQL로 확인한 kukjun/blog 값.
+// GitHub Pages는 CSP 제약이 없어 외부 스크립트(giscus.app) 로드 OK.
+import type { Lang } from '../i18n';
+interface Props { lang: Lang; }
+const { lang } = Astro.props;
+---
+<section class="giscus" aria-label="comments"></section>
+<script
+  is:inline
+  src="https://giscus.app/client.js"
+  data-repo="kukjun/blog"
+  data-repo-id="R_kgDON7gcUg"
+  data-category="Announcements"
+  data-category-id="DIC_kwDON7gcUs4DDgj0"
+  data-mapping="pathname"
+  data-strict="1"
+  data-reactions-enabled="1"
+  data-emit-metadata="0"
+  data-input-position="bottom"
+  data-theme="preferred_color_scheme"
+  data-lang={lang}
+  crossorigin="anonymous"
+  async></script>
+<script is:inline>
+  (function () {
+    var GISCUS_ORIGIN = 'https://giscus.app';
+    function currentTheme() {
+      var t = document.documentElement.getAttribute('data-theme');
+      if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      return t;
+    }
+    function sendTheme() {
+      var f = document.querySelector('iframe.giscus-frame');
+      if (!f) return;
+      f.contentWindow.postMessage({ giscus: { setConfig: { theme: currentTheme() } } }, GISCUS_ORIGIN);
+    }
+    // 우리 테마 토글(data-theme 변경) → giscus 동기화
+    new MutationObserver(sendTheme).observe(document.documentElement, {
+      attributes: true, attributeFilter: ['data-theme'],
+    });
+    // giscus가 준비 신호를 보내면 최초 1회 현재 테마로 맞춤(수동 토글 상태 반영)
+    var synced = false;
+    window.addEventListener('message', function (e) {
+      if (e.origin !== GISCUS_ORIGIN || synced) return;
+      if (e.data && e.data.giscus) { synced = true; sendTheme(); }
+    });
+  })();
+</script>
+<style>
+  .giscus { margin-top: 44px; padding-top: 8px; border-top: 1px solid var(--line-soft); }
+</style>

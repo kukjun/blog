@@ -12,6 +12,7 @@ export const ui = {
     noPosts: 'No posts yet — first one is on the way.',
     updated: 'Updated',
     otherLang: '한국어',
+    views: 'views',
   },
   ko: {
     tagline: '제품이 아니라, 그걸 찍어내는 기계를 만든다.',
@@ -22,6 +23,7 @@ export const ui = {
     noPosts: '아직 글이 없어요 — 첫 글이 곧 올라옵니다.',
     updated: '수정',
     otherLang: 'English',
+    views: '조회',
   },
 } as const;
 

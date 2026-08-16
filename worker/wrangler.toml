@@ -1,0 +1,9 @@
+name = "blog-views"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+# KV 네임스페이스: 아래 id는 `wrangler kv namespace create VIEWS` 실행 후 나오는 값으로 교체.
+[[kv_namespaces]]
+binding = "VIEWS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"

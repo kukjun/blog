@@ -1,0 +1,28 @@
+---
+// 조회수 표시. 내 소유 Cloudflare Worker(+KV)에 hit을 보내고 카운트를 받아 렌더.
+// 같은 브라우저에서 이미 본 글이면 증가시키지 않고 조회만(GET) → 새로고침 인플레이션 방지.
+import { VIEWS_API } from '../siteconfig';
+interface Props { pageKey: string; label: string; }
+const { pageKey, label } = Astro.props;
+---
+<span class="views" data-key={pageKey}><span class="views-num" aria-hidden="true">–</span> {label}</span>
+<script is:inline define:vars={{ VIEWS_API, pageKey }}>
+  (async function () {
+    if (!VIEWS_API) return; // 아직 Worker 미배포면 조용히 종료
+    var box = document.querySelector('.views[data-key="' + (window.CSS && CSS.escape ? CSS.escape(pageKey) : pageKey) + '"]');
+    var el = box && box.querySelector('.views-num');
+    if (!el) return;
+    var flag = 'v:' + pageKey;
+    var seen = false;
+    try { seen = localStorage.getItem(flag) === '1'; } catch (e) {}
+    try {
+      var r = await fetch(VIEWS_API + '/views/' + encodeURIComponent(pageKey), {
+        method: seen ? 'GET' : 'POST',
+      });
+      if (!r.ok) return;
+      var d = await r.json();
+      if (typeof d.count === 'number') el.textContent = d.count.toLocaleString();
+      if (!seen) { try { localStorage.setItem(flag, '1'); } catch (e) {} }
+    } catch (e) { /* 오프라인/에러면 그냥 표시 안 함 */ }
+  })();
+</script>
