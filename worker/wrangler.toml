@@ -6,4 +6,4 @@ workers_dev = true
 # KV 네임스페이스: 아래 id는 `wrangler kv namespace create VIEWS` 실행 후 나오는 값으로 교체.
 [[kv_namespaces]]
 binding = "VIEWS"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "77f1ee5a1e194f2bbce3f22d378ff566"
