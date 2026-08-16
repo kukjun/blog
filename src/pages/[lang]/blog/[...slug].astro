@@ -1,0 +1,40 @@
+---
+import { getCollection, render } from 'astro:content';
+import BaseLayout from '../../../layouts/BaseLayout.astro';
+import { t, parseId, formatDate, withBase, type Lang } from '../../../i18n';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('blog', ({ data }) => !data.draft);
+  return posts.map((post) => {
+    const { lang, slug } = parseId(post.id);
+    return { params: { lang, slug }, props: { post } };
+  });
+}
+
+const { post } = Astro.props;
+const lang = Astro.params.lang as Lang;
+const tr = t(lang);
+const { Content } = await render(post);
+
+// 번역 짝 찾기 (translationKey가 같고 lang이 다른 글)
+const all = await getCollection('blog', ({ data }) => !data.draft);
+const other = all.find(
+  (p) => p.data.translationKey === post.data.translationKey && p.data.lang !== lang,
+);
+const otherHref = other ? withBase(`/${parseId(other.id).lang}/blog/${parseId(other.id).slug}/`) : null;
+---
+<BaseLayout lang={lang} title={post.data.title} description={post.data.description}>
+  <a class="backlink" href={withBase(`/${lang}/`)}>{tr.backToList}</a>
+  <article class="post">
+    <p class="eyebrow">{formatDate(post.data.pubDate, lang)}</p>
+    <h1>{post.data.title}</h1>
+    <p class="lead">{post.data.description}</p>
+    <div class="meta" style="margin-top:10px;">
+      {post.data.tags.map((tag) => <span class="tag">{tag}</span>)}
+      {otherHref && <a href={otherHref} style="margin-left:8px;">🌐 {tr.otherLang}</a>}
+      {post.data.updatedDate && <span> · {tr.updated} {formatDate(post.data.updatedDate, lang)}</span>}
+    </div>
+    <hr />
+    <Content />
+  </article>
+</BaseLayout>

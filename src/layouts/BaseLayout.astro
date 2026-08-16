@@ -1,0 +1,49 @@
+---
+import '../styles/global.css';
+import Header from '../components/Header.astro';
+import { t, withBase, type Lang } from '../i18n';
+
+interface Props {
+  lang: Lang;
+  title: string;
+  description: string;
+}
+const { lang, title, description } = Astro.props;
+const tr = t(lang);
+const canonical = new URL(Astro.url.pathname, Astro.site).href;
+const year = new Date().getFullYear();
+---
+<!doctype html>
+<html lang={lang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="alternate" type="application/rss+xml" title={`RSS (${lang})`} href={withBase(`/rss-${lang}.xml`)} />
+    <!-- FOUC 방지: 저장된 테마 즉시 적용 -->
+    <script is:inline>
+      (function () {
+        try {
+          var s = localStorage.getItem('theme');
+          if (s) document.documentElement.setAttribute('data-theme', s);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <Header lang={lang} />
+    <main class="wrap">
+      <slot />
+    </main>
+    <footer class="site">
+      <div class="wrap">KUKJUN LEE · {tr.role} · © {year} · {tr.tagline}</div>
+    </footer>
+  </body>
+</html>

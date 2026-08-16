@@ -1,0 +1,17 @@
+---
+import { withBase } from '../i18n';
+// 루트는 기본 언어(en)로 보냄. 정적 호스팅 어디서나 동작하는 meta-refresh.
+const target = withBase('/en/');
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content={`0; url=${target}`} />
+    <link rel="canonical" href={target} />
+    <title>Kukjun Lee</title>
+  </head>
+  <body>
+    <p>Redirecting to <a href={target}>{target}</a>…</p>
+  </body>
+</html>

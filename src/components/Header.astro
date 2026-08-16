@@ -1,0 +1,30 @@
+---
+import { t, withBase, type Lang } from '../i18n';
+interface Props { lang: Lang; }
+const { lang } = Astro.props;
+const tr = t(lang);
+---
+<header class="site">
+  <div class="wrap topbar">
+    <a class="brand" href={withBase(`/${lang}/`)}><b>KUKJUN LEE</b> · {tr.role}</a>
+    <div class="navr">
+      <span class="lang">
+        <a href={withBase(`/en/`)} class={lang === 'en' ? 'on' : ''}>EN</a>
+        <a href={withBase(`/ko/`)} class={lang === 'ko' ? 'on' : ''}>KO</a>
+      </span>
+      <button class="toggle" id="themeBtn" aria-label="theme">◐ THEME</button>
+    </div>
+  </div>
+</header>
+<script is:inline>
+  (function () {
+    var btn = document.getElementById('themeBtn'), root = document.documentElement;
+    btn && btn.addEventListener('click', function () {
+      var cur = root.getAttribute('data-theme');
+      if (!cur) cur = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      var next = cur === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      try { localStorage.setItem('theme', next); } catch (e) {}
+    });
+  })();
+</script>

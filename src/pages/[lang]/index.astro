@@ -1,0 +1,42 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import { LANGS, t, parseId, formatDate, withBase, type Lang } from '../../i18n';
+
+export async function getStaticPaths() {
+  return LANGS.map((lang) => ({ params: { lang } }));
+}
+
+const lang = Astro.params.lang as Lang;
+const tr = t(lang);
+
+const all = await getCollection('blog', ({ data }) => !data.draft && data.lang === lang);
+const posts = all.sort(
+  (a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf(),
+);
+---
+<BaseLayout lang={lang} title={`Kukjun Lee — ${tr.role}`} description={tr.tagline}>
+  <p class="eyebrow">{tr.role}</p>
+  <h1>Kukjun Lee</h1>
+  <p class="lead">{tr.tagline}</p>
+
+  <h2 style="font-family:var(--font-mono);font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);margin:36px 0 0;">{tr.posts}</h2>
+
+  {posts.length === 0 ? (
+    <p class="desc">{tr.noPosts}</p>
+  ) : (
+    <ul class="postlist">
+      {posts.map((post) => {
+        const { slug } = parseId(post.id);
+        return (
+          <li>
+            <div class="meta">{formatDate(post.data.pubDate, lang)}</div>
+            <a class="title" href={withBase(`/${lang}/blog/${slug}/`)}>{post.data.title}</a>
+            <p class="desc">{post.data.description}</p>
+            <div>{post.data.tags.map((tag) => <span class="tag">{tag}</span>)}</div>
+          </li>
+        );
+      })}
+    </ul>
+  )}
+</BaseLayout>
