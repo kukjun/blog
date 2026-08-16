@@ -1,12 +1,13 @@
 ---
 import { t, withBase, type Lang } from '../i18n';
+import { IDENTITY } from '../siteconfig';
 interface Props { lang: Lang; }
 const { lang } = Astro.props;
 const tr = t(lang);
 ---
 <header class="site">
   <div class="wrap topbar">
-    <a class="brand" href={withBase(`/${lang}/`)}><b>KUKJUN LEE</b> · {tr.role}</a>
+    <a class="brand" href={withBase(`/${lang}/`)}><b>{IDENTITY.displayName}</b> · {tr.role}</a>
     <div class="navr">
       <span class="lang">
         <a href={withBase(`/en/`)} class={lang === 'en' ? 'on' : ''}>EN</a>

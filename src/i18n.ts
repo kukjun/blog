@@ -13,6 +13,7 @@ export const ui = {
     updated: 'Updated',
     otherLang: '한국어',
     views: 'views',
+    bio: 'I build reliable, portable agent runtimes. Notes on production LLM systems — serving, reliability, deployment.',
   },
   ko: {
     tagline: '제품이 아니라, 그걸 찍어내는 기계를 만든다.',
@@ -24,6 +25,7 @@ export const ui = {
     updated: '수정',
     otherLang: 'English',
     views: '조회',
+    bio: '신뢰할 수 있는 포터블 에이전트 런타임을 만듭니다. 프로덕션 LLM 시스템—서빙·신뢰성·배포—에 대한 기록.',
   },
 } as const;
 
