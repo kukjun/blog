@@ -13,7 +13,7 @@ export const GET: APIRoute = async ({ params, site }) => {
   const posts = await getCollection('blog', ({ data }) => !data.draft && data.lang === lang);
 
   return rss({
-    title: `Kukjun Lee — ${tr.role}`,
+    title: `Kukjun Lee | ${tr.role}`,
     description: tr.tagline,
     site: site ?? 'https://example.com',
     items: posts

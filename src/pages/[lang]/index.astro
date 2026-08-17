@@ -17,7 +17,7 @@ const posts = all.sort(
   (a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf(),
 );
 ---
-<BaseLayout lang={lang} title={`${IDENTITY.displayName} — ${tr.role}`} description={tr.tagline}>
+<BaseLayout lang={lang} title={`${IDENTITY.displayName} | ${tr.role}`} description={tr.tagline}>
   <p class="eyebrow">{tr.role}</p>
   <h1>{IDENTITY.displayName}</h1>
   <p class="lead">{tr.bio}</p>
