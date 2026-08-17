@@ -26,6 +26,28 @@ function remarkMermaid() {
   return (tree) => walk(tree);
 }
 
+// 마크다운 표(<table>)를 <div class="table-scroll">로 감싼다.
+// 표가 길어질 때 칸이 눌리지 않고 가로 스크롤되게. hast를 직접 순회.
+function rehypeTableWrap() {
+  const walk = (node) => {
+    if (!node || !node.children) return;
+    for (let i = 0; i < node.children.length; i++) {
+      const child = node.children[i];
+      if (child.type === 'element' && child.tagName === 'table') {
+        node.children[i] = {
+          type: 'element',
+          tagName: 'div',
+          properties: { className: ['table-scroll'] },
+          children: [child],
+        };
+      } else {
+        walk(child);
+      }
+    }
+  };
+  return (tree) => walk(tree);
+}
+
 // https://astro.build/config
 export default defineConfig({
   site: SITE,
@@ -33,6 +55,7 @@ export default defineConfig({
   trailingSlash: 'ignore',
   markdown: {
     remarkPlugins: [remarkMermaid],
+    rehypePlugins: [rehypeTableWrap],
   },
   i18n: {
     locales: ['en', 'ko'],

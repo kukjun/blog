@@ -65,6 +65,15 @@ article.post :where(p,ul,ol){max-width:var(--read);}
 article.post h2{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;margin:34px 0 10px;}
 article.post h3{font-size:1.18rem;font-weight:800;margin:26px 0 8px;}
 
+/* 표: 셀 테두리로 칸 구분 + 긴 표는 가로 스크롤 */
+.table-scroll{overflow-x:auto;margin:24px 0;border:1px solid var(--line);border-radius:10px;-webkit-overflow-scrolling:touch;}
+.table-scroll table{margin:0;}
+.post table{width:100%;border-collapse:collapse;font-size:.9rem;line-height:1.55;}
+.post thead th{background:var(--bg-2);color:var(--ink);text-align:left;font-weight:700;white-space:nowrap;}
+.post th,.post td{padding:10px 14px;border:1px solid var(--line);vertical-align:top;}
+.post tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--bg-2) 55%,transparent);}
+.post td code{white-space:nowrap;}
+
 .postlist{list-style:none;padding:0;margin:28px 0;}
 .postlist li{padding:20px 0;border-bottom:1px solid var(--line-soft);}
 .postlist a.title{font-size:1.24rem;font-weight:800;letter-spacing:-.02em;color:var(--ink);}
