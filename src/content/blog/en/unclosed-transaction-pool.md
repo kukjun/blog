@@ -1,6 +1,6 @@
 ---
-title: "The heisenbug where updates silently reverted: an unclosed transaction poisoning the pool"
-description: "Updates that 'saved' randomly came back as the old value — and only 20–30 minutes after each restart. A story of ruling out the database, the cache, and finally catching a cron job that returned early inside a transaction and handed a poisoned connection back to the pool."
+title: "Saved, but the value keeps reverting: a transaction left open in the connection pool"
+description: "A value would save fine, then sometimes come back as the old one — and only 20–30 minutes after a restart. The story of ruling out the database, then the cache, and finally catching a cron job that returned early inside a transaction and handed a not-quite-clean connection back to the pool."
 pubDate: 2024-04-01
 lang: en
 tags: ["databases", "debugging", "reliability", "transactions"]
@@ -8,49 +8,51 @@ translationKey: "unclosed-transaction-pool"
 draft: false
 ---
 
-The bug report was the kind that makes you distrust reality. A user updates a value.
-It saves. They refresh — and sometimes the *old* value is back. Same request, same
-code, different outcome. Then the detail that made it worse: **restarting the server
-fixed it, but only for 20–30 minutes,** after which it crept back.
+The bug report I got was a strange one. A user edits a value, and it saves — that part
+works. But when they refresh, the old value is sometimes back. Same request, same code,
+yet it works some of the time and not others.
 
-If you've debugged production long enough, "restart fixes it for a while" makes the
-back of your neck prickle. It's the signature of a bug that isn't in your logic — it's
-in some **shared resource that accumulates state over time.** And the most shared,
-most reused resource in a backend is the **database connection pool.**
+What made it stranger: restarting the server fixed it, but only for about 20–30
+minutes, after which it slowly crept back.
 
-## Reading the symptoms before touching code
+If you've spent time around production, "a restart fixes it for a while" probably makes
+something click. It usually isn't a bug in your logic — it points at a shared resource
+that accumulates state over time. And the most shared, most reused resource in a
+backend is the connection pool.
 
-Three facts, together, already point somewhere:
+## Before opening any code, I read the symptoms
 
-- **Non-deterministic** — identical requests returned different values.
-- **Reverting writes** — an update succeeded, then the stale value reappeared.
-- **Only 20–30 min after a restart** — never on a fresh process.
+Lining up the three symptoms already told me roughly where to look:
 
-A fresh pool has no poisoned connections yet; you have to wait for the offending code
-to run *and* for that connection to be handed back out. So: some requests are drawing
-a connection that carries someone else's leftover state. Now I had a shape to hunt.
+- The same request returns different values from one call to the next.
+- An update saves, then reverts to the old value.
+- A freshly started server is fine; it only shows up 20–30 minutes in.
 
-## The investigation (rule out the cheap suspects first)
+A fresh pool doesn't have a problem connection in it yet. The offending code has to run
+once, and then that connection has to get lent back out — which takes time. So some
+requests were drawing a connection that still carried leftover state from whoever used
+it last. Now I had a shape to chase.
 
-**Suspect 1 — the database.** MariaDB was current with no known issue for this, and
-when I checked who was actually connected, it was only the app and my DataGrip
-session. Nothing rogue on the server side. Ruled out.
+## Ruling out the cheap suspects first
 
-**Suspect 2 — a cache.** There was no Redis in front of it, and TypeORM's built-in
-query cache was disabled. So stale reads weren't a caching artifact. Ruled out.
+I started with the database. MariaDB was on a current version with no known issue for
+this, and when I checked who was actually connected, it was just the app and my own
+DataGrip session. Nothing odd on the server side, so I moved on.
 
-That left the application's own transaction handling. Two logs closed the case:
+Then the cache. There was no Redis in front of it, and TypeORM's built-in query cache
+was turned off, so stale reads couldn't be a caching artifact.
 
-1. **App logs.** With structured logging on, I caught two requests at the *same
-   timestamp* returning different values — one saw the update, one saw stale data.
-   That's the tell: this is **connection-level** state, not data-level state.
-2. **SQL logs.** Turning these on exposed the smoking gun: a `START TRANSACTION` with
-   **no matching COMMIT or ROLLBACK.**
+With those gone, what was left was how the application handled transactions. Two logs
+closed the case. First, once I had structured app logging, I caught two requests
+arriving at the same moment and getting different values — one saw the update, the
+other saw stale data. That was the tell: the data wasn't wrong, different connections
+were simply seeing different things. Then I turned on SQL logging and there it was, a
+`START TRANSACTION` with no matching commit or rollback.
 
-## The root cause: an early return inside a transaction
+## The real cause: a plain `return` inside a transaction
 
-A cron job opened a transaction and then `return`ed early on one branch — before the
-commit:
+A cron job was opening a transaction and then returning early on one branch, before it
+ever committed.
 
 ```javascript
 async badCode() {
@@ -59,48 +61,47 @@ async badCode() {
     await connection.startTransaction();
     // ...business logic...
     if (A === true) {
-      return A;                       // ← returns BEFORE commit/rollback
+      return A;                       // leaves here with no commit and no rollback
     }
     await connection.commitTransaction();
     return dto;
   } catch (e) {
     await connection.rollbackTransaction();
   } finally {
-    await connection.release();       // released — but the transaction is still OPEN
+    await connection.release();       // released — but the transaction is still open
   }
 }
 ```
 
-Here's the subtle part. The `finally` *does* release the connection, so it looks
-"cleaned up." But the early `return` skipped both commit and rollback — so the
-connection goes back to the pool with an **open transaction still attached.** It's
-returned, but it's *dirty.*
+This is the tricky bit. The `finally` does release the connection, so it looks tidy.
+But the early return skipped both the commit and the rollback, so the connection goes
+back to the pool with its transaction still open. It's returned, just not clean.
 
-Why that produces stale reads: under MySQL/MariaDB's default **REPEATABLE READ**, a
-transaction takes a consistent snapshot at its first read and serves *that* frozen
-snapshot for its entire life. A connection stuck mid-transaction keeps showing an old
-view of the world to whoever borrows it next.
+Here's why that surfaces as stale reads. Under MySQL and MariaDB's default REPEATABLE
+READ, a transaction takes a consistent snapshot at its first read and keeps serving
+that same snapshot until it ends. So a connection frozen mid-transaction keeps showing
+an old view of the world to whoever borrows it next.
 
 ```mermaid
 sequenceDiagram
   participant Cron as Cron job
   participant Pool as Connection pool
   participant User as Later request
-  Cron->>Pool: START TRANSACTION, then early return
-  Note over Pool: released but DIRTY<br/>(open txn, frozen snapshot)
-  User->>Pool: borrow a connection
-  Pool-->>User: hands out the dirty one
-  User->>User: reads → sees the frozen snapshot<br/>the update "reverted"
+  Cron->>Pool: START TRANSACTION, then a plain return
+  Note over Pool: returned but not clean<br/>(open transaction, frozen snapshot)
+  User->>Pool: can I borrow a connection?
+  Pool-->>User: hands over that exact one
+  User->>User: reads the frozen old snapshot<br/>the update looks "reverted"
 ```
-<span class="figcap">The poison isn't in the data — it's in the connection. Any request unlucky enough to borrow it inherits a stale, frozen view of the database.</span>
 
-That explains every symptom at once: **non-deterministic** (depends which connection
-you draw), **reverting** (the frozen snapshot predates the write), and
-**warm-up-only** (the cron has to run, and the poisoned connection has to be re-lent).
+Seen this way, all three symptoms line up at once. The result depends on which
+connection you draw, so it's inconsistent. The frozen snapshot predates the write, so
+the value looks reverted. And the cron has to run and its connection has to get re-lent,
+so it only appears once the server has been up a while.
 
-## The fix — and the discipline behind it
+## The fix was simple. The habit behind it mattered more.
 
-Make **every** path commit or roll back before the connection is released:
+I changed it so every path commits or rolls back before the connection is released.
 
 ```javascript
 async goodCode() {
@@ -109,42 +110,39 @@ async goodCode() {
     await connection.startTransaction();
     const dto = A === true
       ? await handleA(connection)
-      : await handleNonA(connection);   // compute the branch INSIDE the try
+      : await handleNonA(connection);   // decide the branch inside the try
     await connection.commitTransaction();
     return dto;
   } catch (e) {
     await connection.rollbackTransaction();
     throw e;
   } finally {
-    await connection.release();          // now always a CLEAN connection
+    await connection.release();          // now it's always a clean connection
   }
 }
 ```
 
-The immediate fix is `try / commit`, `catch / rollback`, `finally / release`. The
-durable fix is to stop hand-managing transaction boundaries at all:
+Commit in `try`, roll back in `catch`, release in `finally`. That was the immediate
+fix. But the longer-lasting one was to stop managing transaction boundaries by hand at
+all. If you wrap them in a `typeorm-transactional` decorator or a `withTransaction(fn)`
+helper, there's no branch you can leave through that skips the commit or rollback. And
+inside a raw transaction block, it's better not to branch or return partway — if you
+need a branch, settle it before you open the transaction.
 
-- **Use a transaction abstraction** — `typeorm-transactional` decorators, or a
-  `withTransaction(fn)` wrapper — so commit/rollback can't be forgotten on any branch.
-- **Never branch or early-return inside a raw transaction block.** Decide the branch
-  first, transact second.
-- **Log structurally, everywhere.** This bug was caught only because same-timestamp
-  logs exposed connection-level divergence. Without that, it hides for weeks.
+One more thing worth saying: the only reason I caught this was the logs. If they hadn't
+shown two same-moment requests getting different values, this could have hidden for
+weeks. Ever since, I keep structured logging on in staging and production as a matter of
+habit.
 
-## What I took away
+Looking back, what made this bug so annoying was that the code that caused it (a cron
+job) and the place the symptom showed up (user requests) had nothing to do with each
+other. When one transaction leaks, the blast radius isn't that code — it's the whole
+pool. It was a good reminder that building something you can't forget beats trying hard
+to remember.
 
-1. **"Only after warm-up" means shared, reused state.** Look at pools and caches
-   before you re-read your own logic.
-2. **A leaked transaction's blast radius is the whole pool** — it poisons requests
-   that have nothing to do with the bug.
-3. **Don't hand-manage what a wrapper can guarantee.** An RAII-style transaction
-   helper turns a rule you have to *remember* into one you *can't forget.*
+## References
 
----
-
-## References & further reading
-
-- MySQL — *Consistent Nonlocking Reads* (REPEATABLE READ snapshots). [docs](https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html)
-- MariaDB — *SET TRANSACTION ISOLATION LEVEL*. [docs](https://mariadb.com/kb/en/set-transaction/)
-- TypeORM — *Transactions & QueryRunner*. [docs](https://typeorm.io/transactions)
-- `typeorm-transactional` — declarative transaction boundaries. [github](https://github.com/Aliheym/typeorm-transactional)
+- MySQL — [Consistent Nonlocking Reads](https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html) (how REPEATABLE READ snapshots work)
+- MariaDB — [SET TRANSACTION ISOLATION LEVEL](https://mariadb.com/kb/en/set-transaction/)
+- TypeORM — [Transactions & QueryRunner](https://typeorm.io/transactions)
+- [typeorm-transactional](https://github.com/Aliheym/typeorm-transactional) — declarative transaction boundaries
