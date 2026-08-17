@@ -23,8 +23,9 @@
   translationKey: "slug"    # en/ko 짝을 잇는 키
   draft: false
   ```
-- **mermaid**: ```mermaid 코드펜스로 작성하면 렌더된다(remark 변환 + 클라이언트 렌더, 테마 동기화). flowchart, sequenceDiagram OK.
+- **mermaid**: ```mermaid 코드펜스로 작성하면 렌더된다(remark 변환 + 클라이언트 렌더, 테마 동기화). flowchart, sequenceDiagram OK. 노드 라벨 안에서도 중간점(·) 쓰지 말고 쉼표나 괄호로.
 - 다이어그램 캡션은 `<span class="figcap">...</span>`.
+- **표(table)**: 그냥 마크다운 표로 쓰면 된다. 빌드 시 `rehypeTableWrap`이 `<div class="table-scroll">`로 감싸서 긴 표는 가로 스크롤되고(칸이 안 눌림), 셀 테두리와 패딩, 헤더 배경, 짝수 행 음영으로 칸이 구분된다(`src/styles/global.css`). 표는 진짜 비교가 필요할 때만 쓰고, 셀 안 텍스트는 너무 길지 않게. 별도 마크업 필요 없음.
 
 ## ★ 글쓰기 기준 (가장 중요)
 
