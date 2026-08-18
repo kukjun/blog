@@ -7,7 +7,7 @@ export const VIEWS_API: string =
 
 // 정체성·연락처 (한 곳에서 관리 → 헤더·푸터·홈 About에서 참조)
 export const IDENTITY = {
-  displayName: 'Kukjun (Jude) Lee',
+  displayName: 'Kukjun Lee (Jude)',
   github: 'https://github.com/kukjun',
   linkedin: 'https://www.linkedin.com/in/kkuk/',
   email: 'lxx3380@gmail.com',
