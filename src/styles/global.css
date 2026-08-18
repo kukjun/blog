@@ -35,12 +35,12 @@ a{color:var(--route);text-decoration:none;} a:hover{text-decoration:underline;}
 strong{color:var(--ink);font-weight:700;} .hl{color:var(--accent);font-weight:700;}
 .mono{font-family:var(--font-mono);}
 code{font-family:var(--font-mono);font-size:.86em;background:var(--bg-2);border:1px solid var(--line-soft);border-radius:5px;padding:1px 5px;}
-pre{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;box-shadow:var(--shadow);}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;}
 pre code{background:none;border:none;padding:0;font-size:.84em;}
 img{max-width:100%;height:auto;border-radius:10px;}
 hr{border:none;border-top:1px solid var(--line);margin:32px 0;}
 blockquote{margin:18px 0;padding:2px 18px;border-left:3px solid var(--accent);color:var(--ink-dim);}
-.mermaid{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 18px;margin:24px 0;text-align:center;overflow-x:auto;box-shadow:var(--shadow);}
+.mermaid{background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:22px 18px;margin:24px 0;text-align:center;overflow-x:auto;}
 .mermaid svg{max-width:100%;height:auto;}
 .figcap{display:block;text-align:center;font-family:var(--font-mono);font-size:.72rem;color:var(--ink-faint);margin:-12px 0 24px;}
 
@@ -59,8 +59,19 @@ header.site{border-bottom:1px solid var(--line);padding:16px 0;position:sticky;t
 .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);font-weight:600;}
 h1{font-size:clamp(1.9rem,4.5vw,2.7rem);line-height:1.08;margin:14px 0 0;font-weight:800;letter-spacing:-.03em;text-wrap:balance;}
 .lead{font-size:1.06rem;color:var(--ink-dim);margin-top:12px;max-width:var(--read);}
-main{padding:44px 0 20px;}
-article.post{padding:32px 0 10px;}
+/* 본문을 solid 카드로 띄워서 격자가 여백에만 보이고 텍스트와 안 겹치게 */
+main.wrap{
+  width:min(848px, 100% - 28px);
+  max-width:none;
+  margin:30px auto 28px;
+  padding:44px clamp(20px,5vw,52px);
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:16px;
+  box-shadow:var(--shadow);
+}
+@media(max-width:640px){main.wrap{padding:28px 18px;border-radius:12px;margin:14px auto 18px;}}
+article.post{padding:8px 0 10px;}
 article.post :where(p,ul,ol){max-width:var(--read);}
 article.post h2{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;margin:34px 0 10px;}
 article.post h3{font-size:1.18rem;font-weight:800;margin:26px 0 8px;}
@@ -69,9 +80,9 @@ article.post h3{font-size:1.18rem;font-weight:800;margin:26px 0 8px;}
 .table-scroll{overflow-x:auto;margin:24px 0;border:1px solid var(--line);border-radius:10px;-webkit-overflow-scrolling:touch;}
 .table-scroll table{margin:0;}
 .post table{width:100%;border-collapse:collapse;font-size:.9rem;line-height:1.55;}
-.post thead th{background:var(--bg-2);color:var(--ink);text-align:left;font-weight:700;white-space:nowrap;}
+.post thead th{background:var(--bg);color:var(--ink);text-align:left;font-weight:700;white-space:nowrap;}
 .post th,.post td{padding:10px 14px;border:1px solid var(--line);vertical-align:top;}
-.post tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--bg-2) 55%,transparent);}
+.post tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--bg) 55%,transparent);}
 .post td code{white-space:nowrap;}
 
 .postlist{list-style:none;padding:0;margin:28px 0;}
