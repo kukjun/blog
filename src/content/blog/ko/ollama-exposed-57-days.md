@@ -1,7 +1,7 @@
 ---
 title: "서버가 멈춰서 로그를 봤더니, 57일 동안 모르는 사람이 우리 LLM을 쓰고 있었어요"
 description: "GPU 서버가 SSH도 안 되게 멈췄어요. 강제 재부팅 후 로그를 뒤지다 외부 IP를 걸러냈더니, 인증도 방화벽도 없이 열려 있던 Ollama API를 누군가 57일 동안 7만 번 넘게 호출하고 있었습니다. 그런데 서버가 멈춘 진짜 이유는 그것만이 아니었어요."
-pubDate: 2026-09-11
+pubDate: 2026-02-06
 lang: ko
 tags: ["보안", "LLM 서빙", "Ollama", "인시던트", "GPU"]
 translationKey: "ollama-exposed-57-days"
