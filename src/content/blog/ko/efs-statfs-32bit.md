@@ -52,9 +52,13 @@ disk guard: free=-5.5GB used=... threshold=10GB -> shed largest job
 
 ## 2의 43제곱을 2의 32제곱으로 나눈 나머지는 0이에요
 
-런타임의 파일시스템 통계 함수를 확인했습니다. 이 함수에는 두 가지 모드가 있어요. 큰
-정수를 그대로 돌려주는 모드와, 일반 숫자로 변환해서 돌려주는 모드입니다. 우리 코드는
-후자를 쓰고 있었고, 그 구현이 블록 수를 부호 있는 32비트 정수로 다루고 있었어요.
+런타임의 파일시스템 통계 함수를 확인했습니다. 우리는 Bun 1.3 계열을 쓰고 있었고,
+`fs.statfsSync`는 Node.js와 같은 인터페이스라 두 가지 모드가 있어요. `bigint` 옵션을
+주면 큰 정수를 그대로 돌려주고, 안 주면 일반 숫자로 변환해서 돌려줍니다. 우리 코드는
+후자를 쓰고 있었고, 당시 Bun의 그 경로 구현이 블록 수를 부호 있는 32비트 정수로
+다루고 있었어요. Node.js에서 같은 코드를 돌리면 이 절단이 안 납니다. 일반 숫자가
+2의 53제곱까지는 정확하거든요. 그러니까 같은 인터페이스를 쓰는 다른 런타임에서는 안
+보이는 버그였습니다.
 
 그리고 공유 파일시스템 쪽 숫자가 문제였습니다. 이 서비스는 용량 제한이 사실상 없어서,
 총 블록 수를 2의 43제곱으로 보고해요. 8엑사바이트에 해당하는 값입니다. 실제로 그만큼
@@ -136,7 +140,8 @@ if (floor > 0) {
 
 ## 참고한 자료
 
-- [fs.statfsSync](https://nodejs.org/api/fs.html#fsstatfssyncpath-options) (Node.js): `bigint` 옵션이 왜 있는지, 기본값이 무엇인지
+- [fs.statfsSync](https://nodejs.org/api/fs.html#fsstatfssyncpath-options) (Node.js): `bigint` 옵션이 왜 있는지, 기본값이 무엇인지. Bun도 같은 인터페이스를 구현해요
+- [Bun node:fs compatibility](https://bun.sh/docs/runtime/nodejs-apis) (Bun): Node.js API 호환 범위와, 구현이 따로라서 동작이 다를 수 있는 지점
 - [statfs(2)](https://man7.org/linux/man-pages/man2/statfs.2.html) (Linux man-pages): `f_blocks`와 `f_bavail`의 정의, 블록 크기와의 관계
 - [Amazon EFS quotas and limits](https://docs.aws.amazon.com/efs/latest/ug/limits.html) (AWS): 파일시스템 크기 상한이 사실상 없다는 것
 - [Number.MAX_SAFE_INTEGER](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER) (MDN): 정수를 일반 숫자로 다룰 때의 경계
