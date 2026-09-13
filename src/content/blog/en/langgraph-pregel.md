@@ -1,6 +1,6 @@
 ---
 title: "What runs again when one parallel node fails in LangGraph?"
-description: "Resuming the same failure with None and resubmitting the original input produced the same result, but different node call counts. Two nodes reveal how reducers, pending writes, and checkpoint queries differ."
+description: "How can I continue a failed run without repeating completed work? Runtime code and an experiment explain why resubmitting input with the same thread_id reruns a successful node, and how resuming with None differs."
 pubDate: 2025-11-28
 updatedDate: 2026-09-13
 lang: en
@@ -10,15 +10,24 @@ featuredOrder: 1
 draft: false
 ---
 
-I connected two nodes in parallel in LangGraph and deliberately made the right node fail
-on its first attempt. The left node had returned a value; the right had raised an exception.
-What should I pass to continue the run? If I send the original input again, will it repeat
-work that already finished?
+When only one of two parallel tasks fails, I want to reuse the completed work and rerun
+only the failed task. Running the successful node again could repeat its computation or
+writes. The question in this post is **which call requests that kind of recovery**.
 
-I tried both approaches separately: resuming with `invoke(None, config)`, and calling
-`invoke({"values": []}, config)` with an empty list in the input. **The final result lists
-were the same, but the left node ran a different number of times.** I would have missed
-the difference if I had only checked the return value.
+Would sending the same input with the same `thread_id` to a graph with saved checkpoints
+be enough? Since `thread_id` identifies the saved state, it's easy to assume that matching
+it will continue the previous work. To check that assumption, I built a graph where one
+of two nodes fails and counted whether the successful node was called again.
+
+The results differed. Resubmitting the original input with `invoke({"values": []}, config)`
+ran the successful left node again. Resuming with `invoke(None, config)` reran only the
+failed right node. **Finding the same saved state and resuming execution from it were
+separate decisions.** In this setup, the input dict takes the new-input processing path,
+while `None` uses saved task results to continue the remaining execution.
+
+Both calls returned the same final list. A correct response alone therefore couldn't tell
+me whether I had avoided repeating completed work. Below, I trace how input processing
+and saved task results produce the difference in call counts.
 
 This is an independent experiment run on September 13, 2026. I used Python 3.11.15,
 LangGraph 1.0.10, langgraph-checkpoint 4.2.0, and langchain-core 1.6.3. It runs the actual
@@ -60,9 +69,13 @@ def right(state):
     return {"values": ["right"]}
 ```
 
+The `RuntimeError` in the right node is an injected condition that creates a partial
+failure. The question under investigation isn't why that exception occurred. It's **why
+resubmitting input after the failure also reruns the successful left node**.
+
 The right node raises its exception **after** leaving a trace. Even though it returns no
-value, `"right"` remains in the Python list. I made that distinction deliberately to check
-whether a node failure also undoes work already done outside the graph.
+value, `"right"` remains in the Python list. Separating a node's return value from work
+already done outside it lets me check what recovery preserves and what it repeats.
 
 I don't compare the order in which the nodes ran. I compare counts with `Counter(effects)`,
 so the result doesn't depend on the order in which the threads execute.
@@ -199,6 +212,40 @@ with `None`.
 Comparing only the response body would miss this difference when checking code that
 continues after a failure. The results matched, but the work done to produce them differed.
 
+## The cause is the different paths for resuming and processing new input
+
+Both experiments used the same graph structure and failure conditions. The only change
+was the input to the second call after failure. To explain the result, I needed to look
+beyond the reducer at **which execution path the runtime selects when it receives input**.
+
+I checked `_first()` in LangGraph 1.0.10's [input-processing code](https://github.com/langchain-ai/langgraph/blob/1.0.10/libs/langgraph/langgraph/pregel/_loop.py).
+With only a `thread_id` in the config and an existing saved checkpoint, as in this example,
+`None` selects the resume path. Then `_match_writes()` attaches outputs from the previous
+attempt to **the same task IDs**. The left task's return value is restored; the right task's
+error record isn't restored as a successful output. The [execution loop](https://github.com/langchain-ai/langgraph/blob/1.0.10/libs/langgraph/langgraph/pregel/main.py)
+passes only tasks without outputs to the runner. That's why the left node ran once and
+only the right node ran again.
+
+By contrast, sending the input dict creates a checkpoint incorporating the new input and
+proceeds with that input. In this graph, `START` receives it and activates both nodes again.
+Even though the previous left result still exists, the newly created task isn't treated
+as already completed. **The same `thread_id` finds the same saved history; it doesn't make
+tasks created from new input identical to the earlier tasks.**
+
+Why, then, did the final list contain only one `left` when the node had run twice?
+At the point of failure, the checkpoint's `values` was still an empty list, with the first
+left return value stored separately in pending writes. The new-input path doesn't first
+merge that return value into `values`. In this experiment, only the newly executed left
+and right return values were combined into `['left', 'right']`. Two execution traces for the
+left node remained in the Python list, but only one result from it was applied to graph state.
+This wasn't because an empty input list reset existing state or because the reducer
+removed duplicates.
+
+To avoid repeating the completed left node in this setup, I therefore had to replace the
+recovery call that resubmitted the original input with `invoke(None, config)`. I checked
+whether that change met the goal by confirming that the left call count stayed at one,
+rather than merely checking for the same final result.
+
 ## Traces outside the checkpoint weren't rolled back
 
 Even in the first experiment, which resumed with `None`, the right node had two entries
@@ -240,4 +287,6 @@ PASS: conflict, state views, resume, new input, effects
 
 - [INVALID_CONCURRENT_GRAPH_UPDATE](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE) (LangGraph): concurrent updates to the same key within a step, and reducers
 - [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (LangGraph): checkpoints, per-task pending writes, and state queries
+- [Input processing and task result restoration](https://github.com/langchain-ai/langgraph/blob/1.0.10/libs/langgraph/langgraph/pregel/_loop.py) (LangGraph 1.0.10): resume and new-input branches in `_first()`, and `_match_writes()`
+- [Task execution loop](https://github.com/langchain-ai/langgraph/blob/1.0.10/libs/langgraph/langgraph/pregel/main.py) (LangGraph 1.0.10): passing only tasks without outputs to the runner
 - [Executable script](/blog/examples/langgraph-supersteps.py) (this post): both experiments, with assertions for state and call counts
