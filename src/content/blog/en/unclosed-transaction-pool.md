@@ -2,6 +2,7 @@
 title: "Saved, but the value keeps reverting: a transaction left open in the connection pool"
 description: "A value would save fine, then sometimes come back as the old one, and only 20 to 30 minutes after a restart. The story of ruling out the database, then the cache, and finally catching a cron job that returned early inside a transaction and handed a not-quite-clean connection back to the pool."
 pubDate: 2024-04-01
+updatedDate: 2026-09-13
 lang: en
 tags: ["databases", "debugging", "reliability", "transactions"]
 translationKey: "unclosed-transaction-pool"
@@ -54,6 +55,9 @@ simply seeing different things. Then I turned on SQL logging and there it was, a
 A cron job was opening a transaction and then returning early on one branch, before it
 ever committed.
 
+The following sketch shows transaction boundaries only; connection setup and business
+functions are omitted.
+
 ```javascript
 async badCode() {
   const connection = getConnection();
@@ -99,6 +103,11 @@ connection you draw, so it's inconsistent. The frozen snapshot predates the writ
 the value looks reverted. And the cron has to run and its connection has to get re-lent,
 so it only appears once the server has been up a while.
 
+Pool behavior depends on the driver and its release/reset policy. The exact historical
+patch versions are not recorded here, so this is not a claim about every current TypeORM
+configuration. The snapshot explanation applies to consistent, nonlocking reads; locking
+reads and UPDATE do not all use that same old snapshot.
+
 ## The fix was simple. The habit behind it mattered more.
 
 I changed it so every path commits or rolls back before the connection is released.
@@ -117,17 +126,16 @@ async goodCode() {
     await connection.rollbackTransaction();
     throw e;
   } finally {
-    await connection.release();          // now it's always a clean connection
+    await connection.release();          // release after finalization; handle finalization failures separately
   }
 }
 ```
 
-Commit in `try`, roll back in `catch`, release in `finally`. That was the immediate fix.
-But the longer-lasting one was to stop managing transaction boundaries by hand at all.
-If you wrap them in a `typeorm-transactional` decorator or a `withTransaction(fn)`
-helper, there's no branch you can leave through that skips the commit or rollback. And
-inside a raw transaction block, it's better not to branch or return partway. If you need
-a branch, settle it before you open the transaction.
+Commit in `try`, roll back in `catch`, release in `finally`: that addressed the early
+return path. A transaction callback or wrapper can centralize this contract, but every
+query must use the transaction's connection. Commit/rollback failure and disposal of a
+broken connection also need handling. Rather than banning every early return, verify
+normal return, early return, and exception paths through the same boundary.
 
 One more thing worth saying: the only reason I caught this was the logs. If they hadn't
 shown two same-moment requests getting different values, this could have hidden for

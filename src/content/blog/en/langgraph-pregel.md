@@ -1,7 +1,8 @@
 ---
 title: "The secret of where LangGraph's state 'magically' updates: it was Pregel all along"
-description: "I lost three days building my first LangGraph agent. I couldn't tell where the state updated or when checkpoints were saved, and even with a debugger it felt like magic. The culprit was Pregel, Google's 2010 graph engine, and once I saw it, everything clicked."
+description: "When does a node’s returned dict become visible to the next node? A small runnable example checks concurrent updates, saved task writes, and recovery after a failure, without an LLM."
 pubDate: 2025-11-28
+updatedDate: 2026-09-13
 lang: en
 tags: ["agents", "LangGraph", "distributed systems", "architecture"]
 translationKey: "langgraph-pregel"
@@ -20,7 +21,10 @@ graph.add_edge(START, "research")
 graph.add_edge("research", "analyze")
 
 app = graph.compile(checkpointer=checkpointer)
-result = app.invoke({"messages": ["Hello"]})
+result = app.invoke(
+    {"messages": ["Hello"]},
+    {"configurable": {"thread_id": "example"}},
+)
 ```
 
 The code looks simple. Make a few nodes, wire them with edges, `compile()`, `invoke()`.
@@ -40,23 +44,18 @@ Then, buried in the docs, one line:
 > "LangGraph's underlying Pregel-inspired architecture…"
 
 Pregel? I'd never seen the word. It turned out to be a large-scale graph processing
-system Google published in 2010, and in that instant I realized every "weird" behavior
-in LangGraph came from it.
+system Google published in 2010. It gave me a way to understand step-based state
+propagation, though persistence and external side effects needed separate explanations.
 
-## I thought I'd been handed a bicycle. It was an F1 car.
+## Separate a function call from a step
 
-LangGraph looks like a workflow library for building `A → B → C` flows. Under the hood
-it's a graph-processing engine for distributed systems.
+The part I had mixed up was the order of function calls and the moment their updates
+become visible. Sequential code can pass one return value to the next function. Parallel
+nodes also need a rule for when and how to combine their updates.
 
-```text
-what I wanted:  a bicycle    (a simple workflow)
-what I got:     an F1 car    (a distributed graph engine)
-```
-
-Hand someone an F1 car and say "it's easy, just hit the gas" and of course they're
-confused. That was me. But here's the twist: once you understand the F1 car, you can do
-things a bicycle never could, like durable resume, human-in-the-loop, parallel
-execution, and transactional guarantees. All of it comes from Pregel.
+LangGraph's Pregel runtime repeats planning, execution, and channel updates in
+super-steps. Persistence is a separate capability provided by a checkpointer. The sketch
+above shows the call structure, not a complete runnable program; there is one below.
 
 ## So what is Pregel?
 
@@ -90,16 +89,16 @@ it. Vertices pass messages to traverse the graph while keeping disk I/O to a min
 
 ## How LangGraph borrowed Pregel
 
-It took Pregel's concepts wholesale and swapped the domain, from graph algorithms to
-workflow orchestration.
+It borrows ideas from Pregel for step-based execution. This is a conceptual comparison,
+not a claim that the APIs or failure guarantees are identical.
 
 | Pregel | LangGraph |
 |---|---|
 | Vertex | Node |
-| Edge | Channel |
+| Messages delivered in the next step | State delivery through channels |
 | Message | State update |
 | Combiner | Reducer |
-| `vote_to_halt()` | `END` node |
+| A vertex voting to halt | A graph path ending at `END` (a different API) |
 
 Put a Pregel PageRank vertex next to a LangGraph node and the difference jumps out.
 
@@ -125,14 +124,14 @@ dict reach the next node? This is exactly where I was stuck for three days.
 ## The state-passing secret, finally
 
 In Pregel, when vertex A sends to B, the message goes on a queue, and B reads it on the
-next super-step. LangGraph is the same.
+next super-step. LangGraph also makes channel updates visible in the following step.
 
 ```python
 # Super-step 1: research_node runs
 def research_node(state):
     return {"research_data": "result"}   # this is just a Channel update
 
-# ── Barrier sync: wait for all nodes, apply Reducer, save Checkpoint ──
+# ── Barrier sync: wait for all nodes, apply Reducer, optionally checkpoint ──
 
 # Super-step 2: analyze_node runs
 def analyze_node(state):
@@ -149,91 +148,85 @@ flowchart LR
     A1["research_node"] --> CH["Channel update"]
     B1["fact_check_node"] --> CH
   end
-  CH --> BAR["barrier sync<br/>Reducer merge, Checkpoint save"]
+  CH --> BAR["barrier sync<br/>Reducer merge, optional checkpoint"]
   BAR --> s2["super-step N+1<br/>analyze_node reads the updated state"]
 ```
-<span class="figcap">Nodes run independently within a round, and only after the barrier merges and saves do we advance. That barrier is the whole trick.</span>
+<span class="figcap">Nodes in one step do not see each other’s new updates during that step. State updates and persistent storage are separate concerns.</span>
 
-## When checkpoints are saved
+## Check concurrent writes and failure directly
 
-Pregel checkpoints after every super-step, and LangGraph does too. It never saves during
-a node, only when the super-step ends, for transactional safety. If anything in a
-super-step fails, the whole round rolls back.
-
-```python
-config = {"configurable": {"thread_id": "user_123"}}
-app.invoke({"messages": ["Hello"]}, config)   # say it fails midway
-# run again, and it auto-resumes from the last checkpoint
-app.invoke({"messages": ["Hello"]}, config)
-```
-
-Durable resume isn't magic, it's a consistent snapshot at every barrier.
-Human-in-the-loop, meaning "pause until approved," is just not starting the next
-super-step until a human acts, since the state is already safely checkpointed.
-
-## Parallelism and the Reducer
-
-Nodes in the same super-step are independent, so they run in parallel. But if two
-parallel nodes touch the same Channel, they collide.
+The original version said that without a reducer, one parallel result overwrites another.
+That mixed up sequential and concurrent updates. When two nodes update the same key
+without a suitable reducer in one step, LangGraph raises `InvalidUpdateError`.
 
 ```python
-def node_a(state): return {"messages": ["A"]}
-def node_b(state): return {"messages": ["B"]}
-# without a Reducer, one overwrites the other. with one, they merge.
-```
-
-The Reducer is Pregel's Combiner. For data that should accumulate, like chat messages,
-you declare it.
-
-```python
-from typing import Annotated
-from langgraph.graph.message import add_messages
+import operator
+from typing import Annotated, TypedDict
 
 class State(TypedDict):
-    messages: Annotated[list, add_messages]   # ["A"] + ["B"] → ["A","B"]
+    values: Annotated[list[str], operator.add]
 ```
 
-## The design philosophy I could finally see
+This reducer concatenates lists. Other reducers have other contracts: `add_messages`,
+for example, can update a message by ID. Each state key needs a deliberate rule for
+combining or rejecting updates.
 
-One by one, my three days of question marks resolved. Taking state as an argument and
-returning a dict is vertex-centric programming: a node doesn't need to know the whole
-flow, just its own job, which makes it easy to unit-test and reuse. `compile()` exists
-because it converts the developer-friendly StateGraph API into an actual Pregel runtime,
-and without it there are no super-steps, no checkpoints, no transactions. And you inject
-a checkpointer because runtime and persistence are separated, so you use `MemorySaver`
-in tests and `PostgresSaver` in production while the runtime code never changes.
+I wrote a [standalone reproduction](/blog/examples/langgraph-supersteps.py) while revising
+this post in September 2026. It is a synthetic example, not the original production code.
+It uses Python 3.11 or later and LangGraph 1.0.10, without an LLM or external API calls.
+Download it and run:
 
-## Conclusion
+```sh
+uv run langgraph-supersteps.py
+```
 
-LangGraph is complex, but there's a reason: it's built on Pregel, which Google has
-battle-tested for over a decade. What first felt like gratuitous complexity was quietly
-buying me durable resume, human-in-the-loop, parallel execution, and transactional
-guarantees, all for free.
+The dependency is declared in the file; `uv` downloads it into a separate environment on
+first use. The program first checks a conflicting update without a reducer. It then adds
+a list reducer and an in-memory checkpointer, and makes the right node fail once.
 
-I thought I'd been handed a bicycle, and it was an F1 car. Once I understood the F1 car,
-I could do things no bicycle could. LangGraph's complexity isn't a bug, it's the
-feature, and when a framework feels like magic there's almost always a well-known system
-underneath that you haven't named yet. For me, that was Pregel.
+```text
+Without a reducer: InvalidUpdateError
+After failure: left=1, right=1; side effects remain
+After resume: left=1, right=2; values=['left', 'right']
+PASS: conflict detection, pending writes, resume, external effects
+```
 
-## Practical tips
+## A whole-round rollback was the wrong explanation
 
-When debugging, think in super-steps.
+The left node succeeded and the right node failed. An unfinished step does not mean
+all successful task results must be discarded. A checkpointer can keep pending writes
+from completed tasks. When I resumed the same thread, the left node did not run again;
+the right node ran a second time.
 
 ```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
-app.invoke({"messages": ["Hello"]})
-# [Super-step 0] START
-# [Super-step 1] research_node, fact_check_node  → Checkpoint saved
-# [Super-step 2] analyze_node                     → Checkpoint saved
+# graph and config are created in the reproduction file.
+result = graph.invoke(None, config)
+for snapshot in graph.get_state_history(config):
+    print(snapshot.metadata, snapshot.values, snapshot.next)
 ```
 
-And you can inspect each step's state snapshot from the checkpoint list.
+Resuming a failed run with `None` is different from submitting a new input dict. An
+`interrupt()` waiting for a response uses `Command(resume=...)`. Reusing a thread ID
+does not make every invocation the same kind of resume.
 
-```python
-for cp in checkpointer.list(config):
-    print(f"Step {cp.id}: {cp.state}")
-```
+The external side effects mattered more. Before returning its state update, each node
+appends a marker to a separate list. The right node's first marker remains after its
+failure, and resuming adds another. That list is outside graph state; a checkpoint does
+not undo it. A node that writes to an external system still needs an idempotency key or
+another explicit boundary for retries.
+
+This example's `InMemorySaver` keeps data only inside the current process. Surviving a
+process restart requires a persistent checkpointer and an operated storage backend.
+
+## Looking back
+
+Knowing Pregel gave me more precise debugging questions: are these nodes in the same
+step, which key do they both update, what reducer governs it, and which external actions
+will happen again after a failure?
+
+A checkpoint alone does not make retries safe. Counting calls in a small example made
+the boundary between runtime guarantees and application responsibilities clearer than
+saying that the whole round rolls back.
 
 ## References
 
@@ -241,3 +234,7 @@ for cp in checkpointer.list(config):
 - L. Valiant, [A Bridging Model for Parallel Computation](https://dl.acm.org/doi/10.1145/79173.79181) (BSP, CACM 1990)
 - LangGraph, [Low-level concepts: Pregel, super-steps, checkpointers](https://langchain-ai.github.io/langgraph/concepts/low_level/)
 - LangGraph, [Persistence & checkpointers](https://langchain-ai.github.io/langgraph/concepts/persistence/) (MemorySaver, PostgresSaver)
+
+- [Concurrent graph updates](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE) (LangGraph): conflicting writes within one step
+- [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (LangGraph): step snapshots and pending writes
+- [Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts) (LangGraph): pausing and resuming with Command

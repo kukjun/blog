@@ -2,6 +2,7 @@
 title: "Scaling a stateful service: when the state can't move, route to it"
 description: "A scraping service held live login sessions in memory. It worked beautifully on one server, then we scaled out and it broke. The story of a dead end (centralizing the browser) and the fix: externalize not the session, but its location."
 pubDate: 2025-08-20
+updatedDate: 2026-09-13
 lang: en
 tags: ["distributed systems", "scaling", "architecture", "AWS"]
 translationKey: "session-aware-routing"
@@ -20,11 +21,9 @@ request found it. Then traffic grew, we put the service behind a load balancer, 
 second server, and it broke right away. Request 2 landed on a machine that had never
 logged in, so the session simply wasn't there.
 
-That's the moment the textbook advice, "just make your servers stateless," stopped being
-useful. My state was a live browser holding a login I couldn't cheaply serialize and
-hand to another machine. The real requirement was uncomfortable but clear: a given
-user's requests must always reach the same server. That's the definition of a stateful
-service, and it's exactly what statelessness advice assumes away.
+The expensive state was the running browser and its work, not just login cookies.
+Follow-up requests needed to reach the owner for the lifetime of that live session.
+That did not mean permanently pinning all of a user's activity to one server.
 
 ## The dead end I walked into first
 
@@ -34,18 +33,17 @@ scraper connect to it, and the session-sharing problem disappears.
 
 It half-worked, and the half that failed taught me the most.
 
-Splitting Playwright into its own tier did help. It saved network resources and cleaned
-up the architecture. But it did not let two servers share a session, because Playwright
-only gives you two ways in, and neither does what I wanted.
+A separate Playwright tier still needed explicit ownership and cleanup of browsers and
+contexts. The original post said that every WebSocket connection creates an independent
+browser. That was wrong as a general description of Playwright.
 
-- WebSocket spins up its own independent browser per connection, so there's no sharing.
-- CDP (Chrome DevTools Protocol) lets you attach to a specific browser by port, but at
-  hundreds of live browsers, managing those ports becomes its own distributed systems
-  problem. I'd just moved the mess, not removed it.
+`browserType.connect()` attaches to an existing browser started with `launchServer()`;
+`connectOverCDP()` can attach to an existing Chromium browser. Selecting and sharing a
+context depends on the server implementation. That historical connection code is not
+recorded here, so I withdraw the claim that the API itself prevented sharing.
 
-So I abandoned the shared-browser idea and kept the architectural split. A dead end that
-eliminates an option is still progress. It told me the session was inherently pinned to
-a server, and I should stop fighting that.
+The design I kept assigned ownership to one server and routed work to that owner,
+rather than allowing arbitrary servers to manipulate the same browser concurrently.
 
 ## The fix: externalize the location, not the session
 
@@ -65,42 +63,49 @@ flowchart TD
 
 Three principles held the design together. First, I externalized the location, not the
 session: the map lives in Redis, while the heavy, un-serializable browser state stays
-exactly where it is. Second, I routed on identity: the first request creates the mapping
+exactly where it is. Second, I routed on the session ID: the first request creates the mapping
 (with a TTL), and every later request carries the session id, so the router looks up its
-owner before forwarding. Third, I planned for failure: a server dying means its sessions
-are gone, so the system detects that and fails cleanly instead of routing into a void.
+owner before forwarding. The mapping is not a copy of the browser state. If the owner
+disappears, pointing at another server does not restore the work; the contract must say
+whether to start a new login or fail the existing job.
+
+The exact historical TTL, error codes, and shutdown verification are not recorded here.
+Rather than invent a completed recovery implementation, these are the boundaries I would
+check in a design using this pattern.
+
+| Lookup result | Behavior to verify |
+|---|---|
+| Valid mapping and live session | Route to the owner and check session access rights |
+| Mapping expired | Distinguish a new job from a follow-up to an existing one |
+| Mapping exists, owner is gone | Require a new login or fail; do not pretend the session moved |
+| Redis lookup fails | Distinguish an unavailable store from an absent mapping |
+
+A TTL expires routing information; it does not terminate the browser. Session cleanup
+and mapping deletion need their own failure cases.
 
 ## Say the trade-offs out loud
 
 Every clever routing design buys a new failure surface. Here's the honest ledger.
 
-| New risk it introduces | How I mitigated it |
+| New risk | Response to evaluate and its limit |
 |---|---|
-| Redis is now a single point of failure | Multi-AZ ElastiCache |
-| A server dies and its sessions are lost | Client-side retry that starts a fresh session |
-| The Lambda routing hop adds cold-start latency | Provisioned concurrency |
+| Redis lookup failure | Multi-AZ still needs application error handling during failover |
+| An owner dies and its sessions are lost | New login and retry, with duplicate work checked separately |
+| Lambda cold-start latency | Compare provisioned concurrency cost with measured latency |
 
-None of these are free. The design is only worth it because the alternative, serializing
-a live browser session on every hop, is worse. Writing the failure modes down next to
-the diagram is how you keep an architecture honest.
+These are responses to evaluate, not a list of measures verified in the historical
+implementation. I chose to find the owner of the live browser. Other designs can share a
+browser context or move serializable state into a store. The relevant questions are
+which state can move and who coordinates concurrent access.
 
-## The pattern generalizes
+This pattern applies when a connection or process-local state has an owner. Uploads
+backed by shared storage and workflows with persistent state need not stay on their
+initial node.
 
-This was never really about scraping. The same shape shows up whenever state is
-expensive to move. In WebSocket fan-out (chat, game servers) the connection lives on one
-node; in chunked file uploads the in-progress upload lives where it started; in
-state-machine workflows the machine's memory is pinned to a worker.
-
-The reusable idea is to define the state's lifecycle, externalize its location, and make
-routing follow it. Sticky sessions is the well-known cousin, and this is the same
-instinct for when the stickiness can't be delegated to the load balancer alone.
-
-Looking back, three things stuck with me. "Make it stateless" is a goal, not a law, so
-it's better to name the genuinely sticky state and design for it than to pretend it
-isn't there. You externalize the cheap thing, a pointer, not the expensive thing, the
-session. And a design's real cost is its new failure modes; I met all three of mine
-eventually, and the only reason they never became incidents is that they were on the
-diagram from day one.
+The useful decision was sharing the location of expensive state. It selected the right
+owner for follow-up requests, but did not automatically recover a lost session. Next time
+I would separately reproduce normal routing, owner shutdown, and TTL expiry, and record
+the response in each case.
 
 ## References
 

@@ -86,6 +86,12 @@ article.post h3{font-size:1.18rem;font-weight:800;margin:26px 0 8px;}
 .post td code{white-space:nowrap;}
 
 .postlist{list-style:none;padding:0;margin:28px 0;}
+.list-heading{font-family:var(--font-mono);font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-dim);margin:44px 0 0;}
+.featured-list{margin:18px 0 32px;border-left:2px solid var(--route);padding-left:20px;}
+.featured-list li:first-child{padding-top:0;}
+.featured-list a.title{display:block;font-size:1.12rem;overflow-wrap:anywhere;}
+.featured-list .desc{font-size:.94rem;}
+.language-note{display:block;font-family:var(--font-mono);font-size:.7rem;color:var(--route);margin-bottom:5px;}
 .postlist li{padding:20px 0;border-bottom:1px solid var(--line-soft);}
 .postlist a.title{font-size:1.24rem;font-weight:800;letter-spacing:-.02em;color:var(--ink);}
 .postlist a.title:hover{color:var(--accent);text-decoration:none;}

@@ -2,6 +2,7 @@
 title: "Two users booked the same seat, inside a transaction"
 description: "A reservation system let two people book the same slot at the same instant, and both succeeded, despite a transaction and a duplicate check. Walking through why the transaction didn't help, fixing it with a Redis lock, and why a unique constraint might have been the better answer."
 pubDate: 2024-05-25
+updatedDate: 2026-09-13
 lang: en
 tags: ["concurrency", "Redis", "distributed systems", "databases"]
 translationKey: "redis-distributed-lock"
@@ -13,9 +14,8 @@ response. The reservation code checked whether the slot was taken before inserti
 the whole thing ran inside a database transaction. My first reaction was probably the
 same one you're having: the transaction should have caught that.
 
-It didn't, and understanding exactly why is the whole point. The fix people reach for
-first, a "bigger" transaction, doesn't work, and the fix that does isn't where beginners
-look.
+Putting the duplicate check inside a transaction had not serialized the two requests.
+I needed to look at the constraint and isolation level that protected the invariant.
 
 ## Why the transaction didn't save me
 
@@ -36,10 +36,11 @@ sequenceDiagram
 ```
 <span class="figcap">Both reads happen before either write. Neither transaction sees the other's uncommitted insert (true under READ COMMITTED and REPEATABLE READ alike), so both believe the seat is free.</span>
 
-Here's the mental model I needed to fix. A transaction gives you atomicity and isolation
-of a snapshot, but it does not give you mutual exclusion across a check-then-act
-sequence. Both requests are executing the same critical section at the same time, and
-nothing is serializing them. A transaction was never the tool for this.
+The problem was relying on a read without a constraint that rejected a duplicate. The
+diagram assumes both transactions can read the empty slot. SERIALIZABLE isolation or
+appropriate locking changes that behavior and can require retrying an aborted transaction.
+The exact historical database, driver version, and isolation setting are not recorded
+here, so this is not a claim about every database transaction.
 
 ## The fix: mutual exclusion with a distributed lock
 
@@ -61,16 +62,19 @@ matters most is to acquire the lock before the transaction and release it in `fi
 Two details separate a working lock from a subtly broken one. A TTL is mandatory: if the
 holder crashes between step 3 and step 6, the TTL frees the lock instead of deadlocking
 that seat forever. And you release only your own lock: store a unique token and verify it
-before deleting, or a slow request whose TTL already expired can delete a different
-request's freshly acquired lock.
+before deleting. That comparison and deletion must be one atomic operation, such as a
+Lua script; ownership can change between separate GET and DEL commands.
+
+This still does not protect the entire operation. An expired holder may continue its DB
+write while a new holder starts. Ownership tokens prevent deleting another holder’s lock,
+not overlapping writes. A database constraint can protect the booking invariant itself.
 
 ## The honest limits, and the fix I'd actually pick
 
 A single Redis is now a single point of failure. Put Redis in a cluster to fix that, and
-you reintroduce the very problem you were solving: coordinating a lock across nodes that
-can disagree with each other. That's what
+you must account for ownership during failover.
 [RedLock](https://redis.io/docs/latest/develop/use/patterns/distributed-locks/)
-addresses, and it's genuinely contested. Kleppmann's
+uses multiple independent Redis instances; it is not ordinary Redis Cluster. Kleppmann’s
 [critique](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
 is required reading. Distributed locking is never as simple as it first looks.
 
@@ -78,22 +82,23 @@ Which is why, for this specific bug, I'd reach for the database before Redis.
 
 | Approach | Best when |
 |---|---|
-| `UNIQUE` constraint on the seat | The invariant is "one booking per seat." Let the DB enforce it: simplest, race-proof, nothing to operate. |
-| `SELECT … FOR UPDATE` (row lock) | You must read-then-write the same rows atomically |
+| `UNIQUE` constraint on the seat | Reject duplicate seat/time-slot pairs. Required keys and conflict handling still matter. |
+| `SELECT … FOR UPDATE` (row lock) | Every booking transaction locks the same existing seat row. Querying a missing reservation is insufficient. |
 | `SERIALIZABLE` isolation | You want the DB itself to detect the conflict and abort one transaction |
 | Redis distributed lock | The critical section spans more than the database: external API calls, multiple data stores |
 
 For double-booking, a unique index on `(seat_id, time_slot)` makes the second insert
-fail by construction. No lock, no race, no TTL to tune. Reach for the distributed lock
-when the critical section is genuinely bigger than one table.
+fail. This assumes required seat and time-slot keys and one reservation per pair.
+Cancellation and rebooking rules may require a different constraint.
 
-Looking back, a couple of things stuck. A transaction isolates, it doesn't serialize
-your check-then-act, so name the race explicitly before you pick a fix, or you'll "fix"
-it with a bigger transaction and watch it happen again. Push the invariant as close to
-the data as you can, because a unique constraint the DB enforces beats a lock you have to
-operate and reason about. And if you must lock, respect the details: a TTL to survive
-crashes, a token so you never free someone else's lock, and clear eyes about what
-cluster-mode consensus really costs.
+I used a Redis lock at the time. Today I would first check whether the database can
+reject the duplicate directly. The historical reason for not adding UNIQUE immediately
+is not recorded here, so I cannot present this as proof that Redis was necessary.
+
+A useful verification would send two concurrent requests for the same seat and slot,
+then check both the final row count and the conflict response. A lock-based design also
+needs a case where its TTL expires during the write. I do not have a recorded post-fix
+load-test result to attach to this account.
 
 ## References
 

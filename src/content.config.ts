@@ -13,6 +13,7 @@ const blog = defineCollection({
     lang: z.enum(['en', 'ko']),
     tags: z.array(z.string()).default([]),
     draft: z.boolean().default(false),
+    featuredOrder: z.number().int().positive().optional(),
     // 번역 짝을 잇는 키 (같은 값이면 en/ko가 서로의 번역)
     translationKey: z.string(),
   }),
