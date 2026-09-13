@@ -1,6 +1,6 @@
 ---
 title: "What runs again when one parallel node fails in LangGraph?"
-description: "How can I continue a failed run without repeating completed work? Runtime code and an experiment explain why resubmitting input with the same thread_id reruns a successful node, and how resuming with None differs."
+description: "I looked into Pregel to understand when node return values update State and when that state is saved. A partial failure in parallel nodes tests my earlier explanation of resuming, while runtime code explains the difference between None and new input."
 pubDate: 2025-11-28
 updatedDate: 2026-09-13
 lang: en
@@ -10,26 +10,34 @@ featuredOrder: 1
 draft: false
 ---
 
-When only one of two parallel tasks fails, I want to reuse the completed work and rerun
-only the failed task. Running the successful node again could repeat its computation or
-writes. The question in this post is **which call requests that kind of recovery**.
+When I built my first agent with LangGraph, **understanding how State moved between nodes**
+was harder than wiring them together. A node returned only a partial dict, yet the next node
+already had the updated values. I hadn't called the next function and passed those values
+myself. Who was combining the state, and when? At what point were checkpoints saved?
 
-Would sending the same input with the same `thread_id` to a graph with saved checkpoints
-be enough? Since `thread_id` identifies the saved state, it's easy to assume that matching
-it will continue the previous work. To check that assumption, I built a graph where one
-of two nodes fails and counted whether the successful node was called again.
+That was the starting point of [the post I first published on November 28, 2025](https://velog.io/@imkkuk/State%EA%B0%80-%EC%96%B4%EB%94%94%EC%84%A0%EA%B0%80-%EC%97%85%EB%8D%B0%EC%9D%B4%ED%8A%B8%EB%90%98%EB%8A%94-LangGraph%EC%9D%98-%EB%B9%84%EB%B0%80).
+As I followed execution in the debugger and searched the documentation, I came across
+Pregel, the underlying execution model. I started reading because I wanted to explain node
+return values, state updates, and checkpoint saves as parts of one flow.
 
-The results differed. Resubmitting the original input with `invoke({"values": []}, config)`
-ran the successful left node again. Resuming with `invoke(None, config)` reran only the
-failed right node. **Finding the same saved state and resuming execution from it were
-separate decisions.** In this setup, the input dict takes the new-input processing path,
-while `None` uses saved task results to continue the remaining execution.
+That post also included an example claiming that **resubmitting the same input automatically
+resumes from the last checkpoint**. This time, I checked that explanation against actual
+execution. To distinguish a node returning a value from a whole step completing, I narrowed
+the experiment to two nodes: one succeeds, and one fails. Where does the successful result
+remain, and which node gets called again when execution continues?
 
-Both calls returned the same final list. A correct response alone therefore couldn't tell
-me whether I had avoided repeating completed work. Below, I trace how input processing
-and saved task results produce the difference in call counts.
+I changed only the input for the comparison. One call uses `invoke(None, config)` with the
+same `thread_id`; the other resubmits the original input with
+`invoke({"values": []}, config)`. In this experiment, resuming with `None` reused the
+successful left result and ran only the right node again. Resubmitting the input dict also
+ran the left node. Even when both calls find the same saved state, the runtime handles
+resuming and new input through different paths.
 
-This is an independent experiment run on September 13, 2026. I used Python 3.11.15,
+Both calls returned the same final list. Looking only at the response would have made it
+hard to see what the original explanation had missed. Below, I connect state query results,
+node call counts, and the runtime's input processing code to explain the difference.
+
+The code below is an independent experiment run on September 13, 2026. I used Python 3.11.15,
 LangGraph 1.0.10, langgraph-checkpoint 4.2.0, and langchain-core 1.6.3. It runs the actual
 LangGraph runtime, without an LLM or external APIs.
 
@@ -285,6 +293,7 @@ PASS: conflict, state views, resume, new input, effects
 
 ## References
 
+- [The secret behind LangGraph's state updates](https://velog.io/@imkkuk/State%EA%B0%80-%EC%96%B4%EB%94%94%EC%84%A0%EA%B0%80-%EC%97%85%EB%8D%B0%EC%9D%B4%ED%8A%B8%EB%90%98%EB%8A%94-LangGraph%EC%9D%98-%EB%B9%84%EB%B0%80) (original post, November 28, 2025): the questions I started with and the explanation of resuming that I revisit here
 - [INVALID_CONCURRENT_GRAPH_UPDATE](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE) (LangGraph): concurrent updates to the same key within a step, and reducers
 - [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (LangGraph): checkpoints, per-task pending writes, and state queries
 - [Input processing and task result restoration](https://github.com/langchain-ai/langgraph/blob/1.0.10/libs/langgraph/langgraph/pregel/_loop.py) (LangGraph 1.0.10): resume and new-input branches in `_first()`, and `_match_writes()`
