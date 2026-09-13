@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["LLM 서빙", "비용", "관측성", "인시던트", "신뢰성"]
 translationKey: "prompt-cache-doubled-cost"
-draft: false
+draft: true
 ---
 
 아침에 청구 대시보드를 열었는데 하루치 LLM 비용이 평소의 몇 배였어요. 뭔가 잘못

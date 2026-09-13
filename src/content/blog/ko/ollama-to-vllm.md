@@ -3,11 +3,10 @@ title: "Ollama에서 vLLM으로: 벤치마크 숫자만으로는 전환을 결�
 description: "동시 요청이 밀리던 서빙을 vLLM과 LiteLLM으로 옮겼습니다. 테스트 장비와 운영 장비, GGUF와 AWQ, 처리량과 출력 품질을 나눠 봐야 했던 전환 기록입니다."
 pubDate: 2026-02-09
 updatedDate: 2026-09-13
-featuredOrder: 3
 lang: ko
 tags: ["LLM 서빙", "vLLM", "성능", "신뢰성"]
 translationKey: "ollama-to-vllm"
-draft: false
+draft: true
 ---
 
 응답용 모델과 추론용 모델을 Ollama로 서빙하고 있었어요. 혼자 쓸 때는 괜찮았는데,

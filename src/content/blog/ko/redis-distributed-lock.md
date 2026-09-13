@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["동시성", "Redis", "분산 시스템", "데이터베이스"]
 translationKey: "redis-distributed-lock"
-draft: false
+draft: true
 ---
 
 두 사용자가 거의 같은 순간에 같은 자리를 예약했는데, 둘 다 성공 응답을 받았어요. 예약

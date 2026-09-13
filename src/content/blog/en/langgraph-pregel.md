@@ -1,240 +1,243 @@
 ---
-title: "The secret of where LangGraph's state 'magically' updates: it was Pregel all along"
-description: "When does a node’s returned dict become visible to the next node? A small runnable example checks concurrent updates, saved task writes, and recovery after a failure, without an LLM."
+title: "What runs again when one parallel node fails in LangGraph?"
+description: "Resuming the same failure with None and resubmitting the original input produced the same result, but different node call counts. Two nodes reveal how reducers, pending writes, and checkpoint queries differ."
 pubDate: 2025-11-28
 updatedDate: 2026-09-13
 lang: en
-tags: ["agents", "LangGraph", "distributed systems", "architecture"]
+tags: ["LangGraph", "concurrency", "error recovery", "checkpoints"]
 translationKey: "langgraph-pregel"
+featuredOrder: 1
 draft: false
 ---
 
-When I built my first LangGraph agent, my head was full of question marks.
+I connected two nodes in parallel in LangGraph and deliberately made the right node fail
+on its first attempt. The left node had returned a value; the right had raised an exception.
+What should I pass to continue the run? If I send the original input again, will it repeat
+work that already finished?
 
-```python
-from langgraph.graph import StateGraph, START, END
+I tried both approaches separately: resuming with `invoke(None, config)`, and calling
+`invoke({"values": []}, config)` with an empty list in the input. **The final result lists
+were the same, but the left node ran a different number of times.** I would have missed
+the difference if I had only checked the return value.
 
-graph = StateGraph(State)
-graph.add_node("research", research_node)
-graph.add_node("analyze", analyze_node)
-graph.add_edge(START, "research")
-graph.add_edge("research", "analyze")
+This is an independent experiment run on September 13, 2026. I used Python 3.11.15,
+LangGraph 1.0.10, langgraph-checkpoint 4.2.0, and langchain-core 1.6.3. It runs the actual
+LangGraph runtime, without an LLM or external APIs.
 
-app = graph.compile(checkpointer=checkpointer)
-result = app.invoke(
-    {"messages": ["Hello"]},
-    {"configurable": {"thread_id": "example"}},
-)
-```
+## I counted results and execution traces separately
 
-The code looks simple. Make a few nodes, wire them with edges, `compile()`, `invoke()`.
-But the moment I ran it, I couldn't tell how the state actually moved, when checkpoints
-were saved, or what a "super-step" even was.
-
-A node does `return {"messages": [new_msg]}` and somehow it reaches the next node, even
-though I never called that node directly. How? The docs only say "each node receives
-the state and returns an update," which left me wondering what that actually meant.
-
-I burned three days on this. I attached a debugger and stepped through it, and the state
-still updated somewhere, checkpoints still saved somewhere. It genuinely felt like
-magic.
-
-Then, buried in the docs, one line:
-
-> "LangGraph's underlying Pregel-inspired architecture…"
-
-Pregel? I'd never seen the word. It turned out to be a large-scale graph processing
-system Google published in 2010. It gave me a way to understand step-based state
-propagation, though persistence and external side effects needed separate explanations.
-
-## Separate a function call from a step
-
-The part I had mixed up was the order of function calls and the moment their updates
-become visible. Sequential code can pass one return value to the next function. Parallel
-nodes also need a rule for when and how to combine their updates.
-
-LangGraph's Pregel runtime repeats planning, execution, and channel updates in
-super-steps. Persistence is a separate capability provided by a checkpointer. The sketch
-above shows the call structure, not a complete runnable program; there is one below.
-
-## So what is Pregel?
-
-In 2010 Google had a problem: running PageRank over billions of pages, and MapReduce
-was too slow. Written in MapReduce, each iteration looks like this.
-
-```python
-for iteration in range(max_iterations):
-    mapped = map_phase(graph)
-    shuffled = shuffle(mapped)   # data over the network
-    graph = reduce_phase(shuffled)
-    save_to_disk(graph)          # disk I/O
-```
-
-Disk I/O and a network shuffle on every iteration is brutal. So they built Pregel, and
-its core idea is "Think Like a Vertex": each vertex reasons only from its own local
-view.
-
-```python
-class Vertex:
-    def compute(self, messages):
-        process(messages)                     # handle received messages
-        for neighbor in self.out_edges:
-            self.send_message(neighbor, data)  # send to neighbors
-        if done():
-            self.vote_to_halt()               # nothing left, so halt
-```
-
-A vertex has no idea what the whole graph looks like. It knows its neighbors, and that's
-it. Vertices pass messages to traverse the graph while keeping disk I/O to a minimum.
-
-## How LangGraph borrowed Pregel
-
-It borrows ideas from Pregel for step-based execution. This is a conceptual comparison,
-not a claim that the APIs or failure guarantees are identical.
-
-| Pregel | LangGraph |
-|---|---|
-| Vertex | Node |
-| Messages delivered in the next step | State delivery through channels |
-| Message | State update |
-| Combiner | Reducer |
-| A vertex voting to halt | A graph path ending at `END` (a different API) |
-
-Put a Pregel PageRank vertex next to a LangGraph node and the difference jumps out.
-
-```python
-# Pregel, sends messages explicitly
-class PageRankVertex(Vertex):
-    def compute(self, messages):
-        self.value = 0.15 + 0.85 * sum(messages)
-        for neighbor in self.out_edges:
-            self.send_message(neighbor, self.value / len(self.out_edges))
-        if converged():
-            self.vote_to_halt()
-
-# LangGraph, just returns a dict
-def research_node(state: State) -> dict:
-    result = search_web(state["messages"][-1])
-    return {"messages": [result], "research_data": result}
-```
-
-Pregel sends via `send_message()`, while LangGraph just returns a dict. So how does that
-dict reach the next node? This is exactly where I was stuck for three days.
-
-## The state-passing secret, finally
-
-In Pregel, when vertex A sends to B, the message goes on a queue, and B reads it on the
-next super-step. LangGraph also makes channel updates visible in the following step.
-
-```python
-# Super-step 1: research_node runs
-def research_node(state):
-    return {"research_data": "result"}   # this is just a Channel update
-
-# ── Barrier sync: wait for all nodes, apply Reducer, optionally checkpoint ──
-
-# Super-step 2: analyze_node runs
-def analyze_node(state):
-    data = state["research_data"]        # already reflected
-```
-
-A node never hands state to the next one directly. It updates a Channel, and at the
-barrier that update is reconciled and becomes visible in the next super-step. That's
-message passing, which is why a bare `return` "magically" propagated.
+The graph is small. `START` activates both nodes, and each node leads to `END` when it
+finishes. The two nodes belong to the same execution step, called a super-step.
 
 ```mermaid
 flowchart LR
-  subgraph s1["super-step N"]
-    A1["research_node"] --> CH["Channel update"]
-    B1["fact_check_node"] --> CH
-  end
-  CH --> BAR["barrier sync<br/>Reducer merge, optional checkpoint"]
-  BAR --> s2["super-step N+1<br/>analyze_node reads the updated state"]
+  S[START] --> L["left<br/>returns a value"]
+  S --> R["right<br/>raises on the first attempt"]
+  L --> E[END]
+  R --> E
 ```
-<span class="figcap">Nodes in one step do not see each other’s new updates during that step. State updates and persistent storage are separate concerns.</span>
 
-## Check concurrent writes and failure directly
+<span class="figcap">I added no branch to decide whether the left node should run again. LangGraph decides which nodes to rerun.</span>
 
-The original version said that without a reducer, one parallel result overwrites another.
-That mixed up sequential and concurrent updates. When two nodes update the same key
-without a suitable reducer in one step, LangGraph raises `InvalidUpdateError`.
+I kept the nodes' return values in the graph's `State`, with call counts and execution traces
+outside it. Here are the two nodes inside `make_graph()` in the
+[complete script](/blog/examples/langgraph-supersteps.py).
 
 ```python
-import operator
-from typing import Annotated, TypedDict
+calls = Counter()
+effects = []
 
+def left(state):
+    calls["left"] += 1
+    effects.append("left")
+    return {"values": ["left"]}
+
+def right(state):
+    calls["right"] += 1
+    effects.append("right")
+    if calls["right"] == 1:
+        raise RuntimeError("deliberate first-attempt failure")
+    return {"values": ["right"]}
+```
+
+The right node raises its exception **after** leaving a trace. Even though it returns no
+value, `"right"` remains in the Python list. I made that distinction deliberately to check
+whether a node failure also undoes work already done outside the graph.
+
+I don't compare the order in which the nodes ran. I compare counts with `Counter(effects)`,
+so the result doesn't depend on the order in which the threads execute.
+
+## First, I needed a way to combine parallel results
+
+Before the main experiment, I checked a smaller failure. What happens if the left and right
+nodes each return a value for the same string field?
+
+```python
+class ConflictingState(TypedDict):
+    value: str
+
+# Updates returned in the same step by the two nodes connected to START
+# left:  {"value": "left"}
+# right: {"value": "right"}
+```
+
+The script's first check catches `InvalidUpdateError` in this case. The later value didn't
+simply overwrite the earlier one. I hadn't defined how to combine two updates received
+in the same step. The [official error documentation](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE)
+also explains that a key receiving concurrent updates needs a reducer.
+
+I wanted to collect both strings, so I defined the state for the main experiment like this.
+
+```python
 class State(TypedDict):
     values: Annotated[list[str], operator.add]
 ```
 
-This reducer concatenates lists. Other reducers have other contracts: `add_messages`,
-for example, can update a message by ID. Each state key needs a deliberate rule for
-combining or rejecting updates.
+`operator.add` concatenates the two lists. That's a rule for combining results. It doesn't
+also decide where execution should resume after a node fails. The conflicting-update check
+and the `RuntimeError` in the right node are two different failures.
 
-I wrote a [standalone reproduction](/blog/examples/langgraph-supersteps.py) while revising
-this post in September 2026. It is a synthetic example, not the original production code.
-It uses Python 3.11 or later and LangGraph 1.0.10, without an LLM or external API calls.
-Download it and run:
+## The left result was visible after the failure
 
-```sh
-uv run langgraph-supersteps.py
-```
-
-The dependency is declared in the file; `uv` downloads it into a separate environment on
-first use. The program first checks a conflicting update without a reducer. It then adds
-a list reducer and an in-memory checkpointer, and makes the right node fail once.
-
-```text
-Without a reducer: InvalidUpdateError
-After failure: left=1, right=1; side effects remain
-After resume: left=1, right=2; values=['left', 'right']
-PASS: conflict detection, pending writes, resume, external effects
-```
-
-## A whole-round rollback was the wrong explanation
-
-The left node succeeded and the right node failed. An unfinished step does not mean
-all successful task results must be discarded. A checkpointer can keep pending writes
-from completed tasks. When I resumed the same thread, the left node did not run again;
-the right node ran a second time.
+I compiled the graph with `InMemorySaver` and assigned a `thread_id` to find the same run.
+The `make_graph()` and `fail_once()` functions below are in the complete script.
+`fail_once()` catches the first run's exception and checks that both nodes were called once.
 
 ```python
-# graph and config are created in the reproduction file.
-result = graph.invoke(None, config)
-for snapshot in graph.get_state_history(config):
-    print(snapshot.metadata, snapshot.values, snapshot.next)
+graph, calls, effects = make_graph()
+config = {"configurable": {"thread_id": "resume-example"}}
+fail_once(graph, config, calls, effects)
+
+live = graph.get_state(config)
+tasks = {task.name: task for task in live.tasks}
 ```
 
-Resuming a failed run with `None` is different from submitting a new input dict. An
-`interrupt()` waiting for a response uses `Command(resume=...)`. Reusing a thread ID
-does not make every invocation the same kind of resume.
+Here is what I found.
 
-The external side effects mattered more. Before returning its state update, each node
-appends a marker to a separate list. The right node's first marker remains after its
-failure, and resuming adds another. That list is outside graph state; a checkpoint does
-not undo it. A node that writes to an external system still needs an idempotency key or
-another explicit boundary for retries.
+```text
+live.values = {'values': ['left']}
+live.next = ('right',)
+tasks['left'].result = {'values': ['left']}
+tasks['right'].error = "RuntimeError('deliberate first-attempt failure')"
+```
 
-This example's `InMemorySaver` keeps data only inside the current process. Surviving a
-process restart requires a persistent checkpointer and an operated storage backend.
+The whole step hadn't succeeded, but the left result remained. LangGraph keeps the outputs
+of successful tasks in the same step as **pending writes**. It can use those results when
+resuming, so it doesn't need to recompute the successful node. This matches the
+[checkpointer documentation on pending writes](https://docs.langchain.com/oss/python/langgraph/checkpointers#why-use-checkpointers).
 
-## Looking back
+The way I queried the state also made a difference. The `config` above contains only a
+`thread_id`. But `live.config` also contains a `checkpoint_id` pointing to a particular
+checkpoint. Passing that back showed a different view at the same moment.
 
-Knowing Pregel gave me more precise debugging questions: are these nodes in the same
-step, which key do they both update, what reducer governs it, and which external actions
-will happen again after a failure?
+```python
+checkpoint = graph.get_state(live.config)
+```
 
-A checkpoint alone does not make retries safe. Counting calls in a small example made
-the boundary between runtime guarantees and application responsibilities clearer than
-saying that the whole round rolls back.
+| Query after failure | Value of the `values` key | `next` |
+| --- | --- | --- |
+| `graph.get_state(config)` | `['left']` | `('right',)` |
+| `graph.get_state(live.config)` | `[]` | `('left', 'right')` |
+
+In this version, querying the latest state with only a `thread_id` also incorporates the
+pending writes of completed tasks. Querying a specific checkpoint showed that checkpoint's
+state. The empty list in the second row therefore doesn't mean the left result was lost.
+To investigate the failed run, I needed to check which config I had used and each task's
+`result` and `error`, alongside `values`.
+
+## Resuming with None ran only the right node again
+
+In the first experiment, I continued without submitting the input again. I used the same
+`config` created above.
+
+```python
+resumed = graph.invoke(None, config)
+```
+
+Here is the result. I sorted the returned list before printing it so the output wouldn't
+depend on execution order.
+
+```text
+RESUME: calls={'left': 1, 'right': 2}, values=['left', 'right'], effects={'left': 1, 'right': 2}
+```
+
+The left node ran just once, on the first attempt. Only the right node ran again, and this
+time it didn't raise an exception, so I received the combined result.
+`graph.get_state(config).next` also became an empty tuple, confirming that no tasks
+remained to run.
+
+## Sending the same input again produced the same result
+
+The second experiment starts with **a new graph and a new saver**. Adding input after the
+first experiment had finished would change the conditions of the comparison. I ran both
+nodes once again, made the right node fail, and then passed a dict containing an empty list.
+
+```python
+fresh_graph, fresh_calls, fresh_effects = make_graph()
+fresh_config = {"configurable": {"thread_id": "new-input-example"}}
+fail_once(fresh_graph, fresh_config, fresh_calls, fresh_effects)
+
+restarted = fresh_graph.invoke({"values": []}, fresh_config)
+```
+
+This was the output.
+
+```text
+NEW_INPUT: calls={'left': 2, 'right': 2}, values=['left', 'right'], effects={'left': 2, 'right': 2}
+```
+
+The final `values` look the same as in the resume case. But the left node also ran twice.
+In this graph, the call with an input dict activated both nodes again through `START`.
+Using the same `thread_id` and the same input values didn't make it equivalent to resuming
+with `None`.
+
+| Second call | Total left calls | Total right calls | Final result |
+| --- | --- | --- | --- |
+| `invoke(None, config)` | 1 | 2 | `['left', 'right']` |
+| `invoke({'values': []}, config)` | 2 | 2 | `['left', 'right']` |
+
+Comparing only the response body would miss this difference when checking code that
+continues after a failure. The results matched, but the work done to produce them differed.
+
+## Traces outside the checkpoint weren't rolled back
+
+Even in the first experiment, which resumed with `None`, the right node had two entries
+in `effects`. Both the `append()` from its failed first attempt and the `append()` from its
+successful second attempt remained. The reducer combined graph state, and the checkpointer
+preserved results needed to resume, but neither restored the separate Python list to its
+previous state.
+
+That list is an observation tool for distinguishing work done outside graph state. This
+doesn't test duplicate handling or idempotency in a real external API. Also, because I used
+`InMemorySaver`, the experiment covers catching an exception and resuming while the process
+stays alive. It doesn't establish recovery after terminating the process.
+
+What I corrected in this experiment was the state definition for combining parallel results
+and the call used to continue a failed run. I used separate traces to check which work still
+repeated afterward. When investigating retries, I want to check both whether the final
+result is correct and which tasks ran how many times. Here, two calls that returned the same
+list did different work.
+
+## Run it yourself
+
+Download the [complete code and assertions](/blog/examples/langgraph-supersteps.py) and run
+this command in that directory. The file includes all the functions and imports used above.
+
+```sh
+uv run --no-project langgraph-supersteps.py
+```
+
+The file specifies Python 3.11 and pins the three main packages. The first run may need to
+download Python and dependencies. No model calls happen during execution. The script checks
+the conflicting updates, the two state views, the difference between resuming and submitting
+new input, and the traces outside graph state. It ends by printing:
+
+```text
+PASS: conflict, state views, resume, new input, effects
+```
 
 ## References
 
-- Malewicz et al., [Pregel: A System for Large-Scale Graph Processing](https://research.google/pubs/pub37252/) (Google, SIGMOD 2010)
-- L. Valiant, [A Bridging Model for Parallel Computation](https://dl.acm.org/doi/10.1145/79173.79181) (BSP, CACM 1990)
-- LangGraph, [Low-level concepts: Pregel, super-steps, checkpointers](https://langchain-ai.github.io/langgraph/concepts/low_level/)
-- LangGraph, [Persistence & checkpointers](https://langchain-ai.github.io/langgraph/concepts/persistence/) (MemorySaver, PostgresSaver)
-
-- [Concurrent graph updates](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE) (LangGraph): conflicting writes within one step
-- [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (LangGraph): step snapshots and pending writes
-- [Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts) (LangGraph): pausing and resuming with Command
+- [INVALID_CONCURRENT_GRAPH_UPDATE](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE) (LangGraph): concurrent updates to the same key within a step, and reducers
+- [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (LangGraph): checkpoints, per-task pending writes, and state queries
+- [Executable script](/blog/examples/langgraph-supersteps.py) (this post): both experiments, with assertions for state and call counts

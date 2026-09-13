@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: en
 tags: ["concurrency", "Redis", "distributed systems", "databases"]
 translationKey: "redis-distributed-lock"
-draft: false
+draft: true
 ---
 
 Two users booked the same seat at nearly the same instant, and both got a success

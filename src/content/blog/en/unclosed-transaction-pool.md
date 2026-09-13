@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: en
 tags: ["databases", "debugging", "reliability", "transactions"]
 translationKey: "unclosed-transaction-pool"
-draft: false
+draft: true
 ---
 
 The bug report I got was a strange one. A user edits a value, and it saves. That part

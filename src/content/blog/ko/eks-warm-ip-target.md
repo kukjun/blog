@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["Kubernetes", "EKS", "네트워크", "디버깅", "신뢰성"]
 translationKey: "eks-warm-ip-target"
-draft: false
+draft: true
 ---
 
 시작은 팀 채널에 올라온 알림 하나였어요. 시간별로 도는 배치 DAG의 첫 태스크가 실패했다는

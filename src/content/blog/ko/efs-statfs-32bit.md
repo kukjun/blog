@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["스토리지", "디버깅", "신뢰성", "AWS", "Node.js"]
 translationKey: "efs-statfs-32bit"
-draft: false
+draft: true
 ---
 
 스토리지를 블록 볼륨에서 공유 파일시스템으로 옮긴 다음 날이었어요. 제품이 이상하게

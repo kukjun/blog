@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["성능", "디버깅", "스토리지", "Node.js", "신뢰성"]
 translationKey: "nfs-open-amplification"
-draft: false
+draft: true
 ---
 
 "웹이 느려요"라는 제보를 받았습니다. 이런 제보는 보통 막막해요. 느리다는 게 어디가

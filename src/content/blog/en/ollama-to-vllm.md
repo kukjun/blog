@@ -3,11 +3,10 @@ title: "From Ollama to vLLM: benchmark numbers weren't enough to decide"
 description: "Moving a serving stack to vLLM and LiteLLM meant separating test hardware from production hardware, GGUF from AWQ, and throughput from output quality."
 pubDate: 2026-02-09
 updatedDate: 2026-09-13
-featuredOrder: 3
 lang: en
 tags: ["LLM serving", "vLLM", "performance", "reliability"]
 translationKey: "ollama-to-vllm"
-draft: false
+draft: true
 ---
 
 We were serving response and reasoning models through Ollama. It worked well when

@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["분산 시스템", "확장", "아키텍처", "AWS"]
 translationKey: "session-aware-routing"
-draft: false
+draft: true
 ---
 
 스크래핑 서비스는 사이트에 로그인한 다음, 그 로그인한 사용자로 계속 일해야 했어요.

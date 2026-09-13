@@ -1,243 +1,236 @@
 ---
-title: "State가 '어디선가' 업데이트되는 LangGraph의 비밀, 알고 보니 Pregel이었어요"
-description: "노드가 반환한 dict는 언제 다음 노드에 보일까요? Pregel의 실행 단위로 상태 전달을 이해하고, 병렬 갱신 충돌과 실패 후 재개를 외부 모델 없이 실행하는 작은 예제로 확인했습니다."
+title: "LangGraph에서 병렬 노드 하나가 실패하면 무엇이 다시 실행될까요"
+description: "같은 실패에서 None으로 재개했을 때와 처음의 입력을 다시 보냈을 때, 최종 결과는 같고 노드 실행 횟수는 달랐습니다. 두 노드의 실행 기록으로 reducer, pending writes, 체크포인트 조회의 차이를 확인합니다."
 pubDate: 2025-11-28
 updatedDate: 2026-09-13
 lang: ko
-tags: ["에이전트", "LangGraph", "분산 시스템", "아키텍처"]
+tags: ["LangGraph", "동시성", "오류 복구", "체크포인트"]
 translationKey: "langgraph-pregel"
+featuredOrder: 1
 draft: false
 ---
 
-LangGraph로 첫 에이전트를 만들 때, 머릿속이 물음표 투성이였어요. 아래는 당시 헷갈렸던 호출 구조를 줄인 코드이고, 단독 실행 예제는 뒤에 따로 두었습니다.
+LangGraph에 노드 두 개를 병렬로 연결하고, 오른쪽 노드의 첫 실행을 일부러 실패시켰습니다.
+왼쪽은 값을 반환했고 오른쪽은 예외를 던진 상태예요. 여기서 실행을 이어가려면 무엇을
+넘겨야 할까요. 처음 보낸 입력을 다시 보내도, 끝난 작업까지 다시 하지는 않을까요.
 
-```python
-from langgraph.graph import StateGraph, START, END
+두 방법을 각각 실행해봤습니다. `invoke(None, config)`로 재개한 경우와 빈 목록을 담은
+`invoke({"values": []}, config)`를 호출한 경우입니다. **최종 결과 목록은 같았는데,
+왼쪽 노드가 실행된 횟수는 달랐어요.** 반환값만 확인했다면 차이를 놓쳤을 겁니다.
 
-graph = StateGraph(State)
-graph.add_node("research", research_node)
-graph.add_node("analyze", analyze_node)
-graph.add_edge(START, "research")
-graph.add_edge("research", "analyze")
+이 글은 2026년 9월 13일에 실행한 독립 실험입니다. Python 3.11.15, LangGraph 1.0.10,
+langgraph-checkpoint 4.2.0, langchain-core 1.6.3을 사용했어요. LLM과 외부 API 없이
+실제 LangGraph 런타임의 동작을 확인했습니다.
 
-app = graph.compile(checkpointer=checkpointer)
-result = app.invoke(
-    {"messages": ["Hello"]},
-    {"configurable": {"thread_id": "example"}},
-)
-```
+## 결과와 실행 흔적을 따로 셌어요
 
-코드는 간단해 보입니다. 노드 몇 개 만들고, 엣지로 연결하고, `compile()`하고
-`invoke()`. 그런데 막상 돌려 보면 State가 대체 어떻게 움직이는 건지, 체크포인트는
-언제 저장되는지, Super-step이 뭔지 하나도 이해가 안 됐어요.
-
-`research_node`에서 `return {"messages": [new_msg]}` 하나 했을 뿐인데 다음 노드에
-전달됩니다. 함수를 직접 호출한 것도 아닌데 어떻게 그러는 걸까요. 공식 문서에는 "각
-노드는 State를 받아 업데이트를 반환합니다"라고만 적혀 있었어요. 그래서 어쩌라는 걸까
-싶었죠.
-
-3일을 삽질했습니다. 디버거를 붙여서 한 스텝씩 따라가 봐도 State가 "어디선가"
-업데이트되고, 체크포인트가 "어디선가" 저장됐어요. 말 그대로 마법 같았습니다.
-
-그러다 문서를 뒤지던 중에 한 줄을 만났어요.
-
-> "LangGraph's underlying Pregel-inspired architecture…"
-
-Pregel이요? 처음 보는 단어였습니다. 찾아보니 Google이 2010년에 발표한 대규모 그래프
-처리 시스템이더라고요. 이 구조가 상태 전달을 이해하는 실마리였어요. 다만 Pregel의 원리를 안다고
-체크포인트 저장이나 외부 API의 실패 처리까지 자동으로 설명되는 것은 아니었습니다.
-
-## 함수 호출과 실행 단위를 나눠서 봤어요
-
-제가 혼동한 건 노드 함수를 호출하는 순서와 상태가 반영되는 시점이었습니다. 순차 코드라면
-앞 함수의 반환값을 다음 함수에 넘기면 돼요. 병렬 노드가 같은 상태를 읽는 구조에서는
-어느 업데이트를 언제 합칠지도 정해야 합니다.
-
-LangGraph의 Pregel 런타임은 실행할 노드를 고르고, 실행하고, 채널에 업데이트를 반영하는
-단계를 반복합니다. 이 실행 단위를 Super-step이라고 불러요. 영속 저장은 checkpointer를
-연결했을 때 추가되는 기능입니다. 이 둘을 나눠 보니 무엇을 확인해야 할지 좁혀졌어요.
-
-## 도대체 Pregel이 뭐길래요
-
-2010년 Google에는 문제가 있었습니다. PageRank를 수십억 개 웹페이지에 돌려야 하는데
-MapReduce로는 너무 느렸어요. MapReduce로 짜면 매 반복마다 이렇습니다.
-
-```python
-for iteration in range(max_iterations):
-    mapped = map_phase(graph)
-    shuffled = shuffle(mapped)   # 네트워크로 데이터 전송
-    graph = reduce_phase(shuffled)
-    save_to_disk(graph)          # 디스크 I/O
-```
-
-반복마다 디스크 I/O에 네트워크 셔플까지 걸리니 죽을 맛이죠. 그래서 Pregel을 만들었고,
-핵심 아이디어는 "Think Like a Vertex"였어요. 각 정점이 오직 자기 로컬 관점에서만
-생각하게 하는 겁니다.
-
-```python
-class Vertex:
-    def compute(self, messages):
-        process(messages)                     # 받은 메시지 처리
-        for neighbor in self.out_edges:
-            self.send_message(neighbor, data)  # 이웃에게 전송
-        if done():
-            self.vote_to_halt()               # 할 일 없으면 종료
-```
-
-정점은 전체 그래프가 어떻게 생겼는지 몰라요. 자기 이웃만 압니다. 그게 전부예요. 메시지를
-주고받으며 그래프를 순회하고, 그 사이 디스크 I/O를 최소화합니다.
-
-## LangGraph는 Pregel을 어떻게 가져왔나요
-
-LangGraph는 Pregel의 단계별 실행에서 아이디어를 가져왔습니다. 다음 표는 이해를 위한
-비교예요. 두 시스템의 API나 실패 보장이 일대일로 같다는 뜻은 아닙니다.
-
-| Pregel | LangGraph |
-|---|---|
-| Vertex | Node |
-| 다음 단계로 보내는 메시지 | Channel을 통한 상태 전달 |
-| Message | State 업데이트 |
-| Combiner | Reducer |
-| 정점의 실행 중단 의사 표시 | `END`로 이어지는 그래프 종료 경로 (같은 API는 아님) |
-
-Pregel의 PageRank 정점과 LangGraph 노드를 나란히 놓으면 차이가 보입니다.
-
-```python
-# Pregel, 명시적으로 send_message
-class PageRankVertex(Vertex):
-    def compute(self, messages):
-        self.value = 0.15 + 0.85 * sum(messages)
-        for neighbor in self.out_edges:
-            self.send_message(neighbor, self.value / len(self.out_edges))
-        if converged():
-            self.vote_to_halt()
-
-# LangGraph, 그냥 dict를 return
-def research_node(state: State) -> dict:
-    result = search_web(state["messages"][-1])
-    return {"messages": [result], "research_data": result}
-```
-
-Pregel은 `send_message()`로 명시적으로 보내는데, LangGraph는 그냥 dict를 반환해요.
-그럼 이 dict는 어떻게 다음 노드로 가는 걸까요. 바로 여기가 제가 3일을 막혔던
-지점입니다.
-
-## 드디어 풀린 State 전달의 비밀
-
-Pregel에서 정점 A가 B에게 메시지를 보내면, 그 메시지는 먼저 큐에 저장되고, 다음
-Super-step에서 B가 읽어요. LangGraph에서도 한 단계의 채널 업데이트는 다음 단계에서
-읽을 수 있게 됩니다.
-
-```python
-# Super-step 1: research_node 실행
-def research_node(state):
-    return {"research_data": "result"}   # Channel 업데이트일 뿐
-
-# ── Barrier Sync: 모든 노드 완료 대기, Reducer 적용, checkpointer가 있으면 스냅샷 저장 ──
-
-# Super-step 2: analyze_node 실행
-def analyze_node(state):
-    data = state["research_data"]        # 이미 반영돼 있음
-```
-
-노드는 State를 직접 넘기지 않아요. Channel을 업데이트하면, 배리어에서 정리된 뒤 다음
-Super-step에 반영됩니다. 이게 메시지 패싱이에요. 그래서 `return`만 했는데 알아서
-전달되는 것처럼 보였던 거고요.
+필요한 그래프는 작습니다. `START`에서 두 노드를 활성화하고, 각 노드가 끝나면 `END`로
+이어집니다. 두 노드는 같은 실행 단계인 super-step에 속해요.
 
 ```mermaid
 flowchart LR
-  subgraph s1["Super-step N"]
-    A1["research_node"] --> CH["Channel 업데이트"]
-    B1["fact_check_node"] --> CH
-  end
-  CH --> BAR["Barrier Sync<br/>Reducer 병합, 선택적 체크포인트"]
-  BAR --> s2["Super-step N+1<br/>analyze_node가 갱신된 State를 읽음"]
+  S[START] --> L["left<br/>값 반환"]
+  S --> R["right<br/>첫 실행에서 예외"]
+  L --> E[END]
+  R --> E
 ```
-<span class="figcap">같은 단계의 노드는 그 단계 안에서 다른 노드의 새 업데이트를 읽지 않아요. 상태 갱신과 영속 저장은 구분해서 봐야 합니다.</span>
 
-## 병렬 갱신과 실패를 직접 확인했어요
+<span class="figcap">왼쪽의 재실행 여부를 결정하는 분기는 넣지 않았습니다. 어느 노드를 다시 실행할지는 LangGraph가 결정해요.</span>
 
-처음 글에서는 reducer가 없으면 병렬 결과 중 하나가 덮어써진다고 적었어요. 순차 갱신과
-병렬 갱신을 섞은 설명이었습니다. 같은 단계에서 두 노드가 reducer 없는 동일 키를 갱신하면
-`InvalidUpdateError`가 발생합니다. 여러 결과를 모으려면 합치는 규칙이 필요해요.
+노드가 반환하는 값은 그래프의 `State`에 넣고, 호출 횟수와 실행 흔적은 그 밖에 두었습니다.
+[전체 실행 파일](/blog/examples/langgraph-supersteps.py)의 `make_graph()` 안에 있는 두 노드는
+이렇게 생겼어요.
 
 ```python
-import operator
-from typing import Annotated, TypedDict
+calls = Counter()
+effects = []
 
+def left(state):
+    calls["left"] += 1
+    effects.append("left")
+    return {"values": ["left"]}
+
+def right(state):
+    calls["right"] += 1
+    effects.append("right")
+    if calls["right"] == 1:
+        raise RuntimeError("deliberate first-attempt failure")
+    return {"values": ["right"]}
+```
+
+오른쪽은 흔적을 남긴 **뒤에** 예외를 던집니다. 따라서 값을 반환하지 못했더라도
+Python 리스트에는 `"right"`가 남아요. 이 차이를 일부러 만들었습니다. 노드의 실패가
+그래프 바깥에서 이미 한 일까지 되돌리는지 확인하려는 거예요.
+
+두 노드의 실행 순서는 비교하지 않습니다. `Counter(effects)`로 횟수를 비교해서,
+스레드가 어느 순서로 실행됐는지를 결과의 조건으로 넣지 않았어요.
+
+## 먼저, 병렬 결과를 합치는 방법이 필요했어요
+
+본 실험 전에 더 작은 실패를 확인했습니다. 문자열 키 하나에 왼쪽과 오른쪽이 각각
+값을 반환하게 만들면 어떻게 될까요.
+
+```python
+class ConflictingState(TypedDict):
+    value: str
+
+# START에 연결한 두 노드가 같은 단계에서 반환하는 값
+# left:  {"value": "left"}
+# right: {"value": "right"}
+```
+
+이 경우 예제의 첫 검사는 `InvalidUpdateError`를 잡습니다. 나중 값이 앞의 값을
+덮어쓰는 식으로 끝나지 않았어요. 같은 단계에서 받은 두 업데이트를 어떻게 합칠지
+정의하지 않았기 때문입니다. [공식 오류 설명](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE)도
+병렬 갱신을 받는 키에 reducer를 정의하도록 설명해요.
+
+제가 원하는 결과는 두 문자열을 모두 모으는 것이어서, 본 실험의 상태는 이렇게 정의했습니다.
+
+```python
 class State(TypedDict):
     values: Annotated[list[str], operator.add]
 ```
 
-이 예에서는 리스트를 합칩니다. `add_messages`는 메시지 ID를 보고 기존 메시지를 갱신할 수도
-있으니, 모든 reducer가 단순 덧셈이라는 뜻은 아니에요. 어떤 충돌을 합치고 어떤 충돌을
-거절할지 상태 키별로 정해야 합니다.
+`operator.add`가 두 리스트를 합칩니다. 이것은 결과를 합치는 규칙이에요. 노드가 실패하면
+어디부터 다시 실행할지 정하는 기능까지 맡지는 않습니다. 앞의 충돌 검사와 오른쪽에 넣은
+`RuntimeError`는 서로 다른 실패입니다.
 
-설명을 검증하려고 [별도 재현 코드](/blog/examples/langgraph-supersteps.py)를 작성했어요.
-과거 운영 코드가 아니라 2026년 9월에 글을 수정하면서 만든 예제입니다. Python 3.11 이상과
-LangGraph 1.0.10을 사용하고, LLM이나 외부 API는 부르지 않습니다.
+## 실패했는데 왼쪽 결과가 보였어요
 
-파일을 내려받은 뒤 다음 명령으로 실행할 수 있어요. `uv`는 파일에 적힌 의존성을 별도
-환경에 설치하므로 최초 실행에는 패키지 다운로드가 필요합니다.
-
-```sh
-uv run langgraph-supersteps.py
-```
-
-예제는 먼저 reducer 없는 두 노드의 갱신 충돌을 확인합니다. 다음에는 리스트 reducer와
-메모리 checkpointer를 연결하고, 오른쪽 노드가 첫 시도에서만 실패하도록 만들었어요.
-관찰한 출력은 다음과 같습니다.
-
-```text
-Without a reducer: InvalidUpdateError
-After failure: left=1, right=1; side effects remain
-After resume: left=1, right=2; values=['left', 'right']
-PASS: conflict detection, pending writes, resume, external effects
-```
-
-## 전체 롤백이라는 말로는 설명이 안 됐어요
-
-왼쪽 노드는 성공했고 오른쪽만 실패했습니다. 이때 그래프의 단계가 끝나지 않았다고 해서
-성공한 노드의 결과까지 모두 버리는 것은 아니에요. checkpointer는 완료된 작업의
-pending writes를 보존할 수 있습니다. 같은 스레드를 재개하자 왼쪽은 다시 실행되지 않았고
-오른쪽만 두 번째로 실행됐어요.
+그래프를 `InMemorySaver`와 함께 컴파일하고 같은 실행을 찾을 `thread_id`를 지정했습니다.
+아래의 `make_graph()`와 `fail_once()`는 전체 실행 파일에 있는 함수예요. `fail_once()`는
+첫 실행의 예외를 잡고 두 노드가 한 번씩 호출됐는지도 검사합니다.
 
 ```python
-# graph와 config는 위 재현 파일에서 생성해요.
-result = graph.invoke(None, config)
-for snapshot in graph.get_state_history(config):
-    print(snapshot.metadata, snapshot.values, snapshot.next)
+graph, calls, effects = make_graph()
+config = {"configurable": {"thread_id": "resume-example"}}
+fail_once(graph, config, calls, effects)
+
+live = graph.get_state(config)
+tasks = {task.name: task for task in live.tasks}
 ```
 
-실패한 실행을 이어갈 때의 `None`과 새 입력 dict를 보내는 것은 구분해야 합니다.
-`interrupt()`에서 멈춘 실행에 답할 때는 `Command(resume=...)`를 사용해요.
-같은 thread_id를 쓴다는 이유만으로 모든 호출이 같은 재개를 뜻하지는 않습니다.
+확인한 값은 이랬습니다.
 
-더 중요한 건 외부 부작용이었어요. 예제의 노드는 상태 반환 전에 별도의 리스트에 호출
-흔적을 남깁니다. 오른쪽이 실패해도 그 흔적은 사라지지 않고, 재개하면 하나 더 생겨요.
-이 리스트는 그래프 상태 밖에 있으므로 체크포인트가 되돌려주지 않습니다. 실제로 외부
-시스템에 쓰는 노드라면 중복 실행을 막을 키나 재시도 가능한 작업 경계가 별도로 필요해요.
+```text
+live.values = {'values': ['left']}
+live.next = ('right',)
+tasks['left'].result = {'values': ['left']}
+tasks['right'].error = "RuntimeError('deliberate first-attempt failure')"
+```
 
-이 예제의 `InMemorySaver`는 같은 프로세스 안에서만 상태를 보관합니다. 프로세스가 죽은
-뒤에도 재개하려면 영속 checkpointer와 그 저장소의 운영을 따로 준비해야 해요.
+단계 전체가 성공한 건 아닌데 왼쪽 결과는 남아 있습니다. LangGraph는 같은 단계에서
+성공한 작업의 출력을 **pending writes**로 보관합니다. 이 결과를 재개할 때 사용할 수
+있어서 성공한 노드를 다시 계산하지 않아도 돼요. 이 동작은
+[checkpointer의 pending writes 설명](https://docs.langchain.com/oss/python/langgraph/checkpointers#why-use-checkpointers)과도
+맞습니다.
 
-## 돌아보면
+여기서 조회 방법에 따른 차이도 있었습니다. 위 `config`에는 `thread_id`만 있어요.
+그런데 `live.config`에는 특정 체크포인트를 가리키는 `checkpoint_id`도 들어 있습니다.
+그걸 다시 넘기면 같은 시점에도 다른 모습이 보였어요.
 
-Pregel을 알게 된 뒤 유용했던 건 이름 자체보다, 디버깅할 질문이 구체적으로 바뀌었다는
-점이에요. 두 노드가 같은 단계에서 같은 키를 쓰는지, 그 키의 reducer가 무엇인지,
-실패한 노드가 재개할 때 외부 작업도 반복하는지를 나눠서 볼 수 있게 됐습니다.
+```python
+checkpoint = graph.get_state(live.config)
+```
 
-체크포인트가 있다는 이유로 안전한 재시도가 완성되지는 않았어요. 런타임이 보존하는
-범위와 애플리케이션이 책임질 범위를 예제의 호출 횟수로 확인하는 편이, 전체가 롤백된다는
-한 문장보다 정확했습니다.
+| 실패 후 조회 | `values` 키의 값 | `next` |
+| --- | --- | --- |
+| `graph.get_state(config)` | `['left']` | `('right',)` |
+| `graph.get_state(live.config)` | `[]` | `('left', 'right')` |
+
+이 버전에서 `thread_id`만 지정한 최신 상태 조회는 완료된 작업의 pending writes까지
+반영합니다. 특정 체크포인트를 지정한 조회는 그 체크포인트의 상태를 보여줬어요.
+따라서 두 번째 행의 빈 목록만 보고 “왼쪽 결과도 사라졌다”고 해석하면 안 됩니다.
+실패한 실행을 조사할 때는 `values`뿐 아니라 어떤 config로 조회했는지와 작업의
+`result`, `error`도 같이 봐야 했어요.
+
+## None으로 재개하니 오른쪽만 다시 실행됐습니다
+
+첫 실험은 입력을 다시 넣지 않고 이어갔습니다. 위에서 만든 `config`를 그대로 사용해요.
+
+```python
+resumed = graph.invoke(None, config)
+```
+
+결과는 다음과 같습니다. 실행 순서에 기대지 않도록 반환 목록을 정렬해서 출력했어요.
+
+```text
+RESUME: calls={'left': 1, 'right': 2}, values=['left', 'right'], effects={'left': 1, 'right': 2}
+```
+
+왼쪽은 첫 실행 한 번으로 끝났습니다. 오른쪽만 다시 실행됐고, 이번에는 예외를 던지지
+않아 두 값을 합친 결과를 받았어요. `graph.get_state(config).next`도 빈 튜플이 됐습니다.
+진행할 작업이 남지 않은 것을 확인한 거예요.
+
+## 같은 입력을 다시 보내도 결과는 같았어요
+
+두 번째 실험은 **새 그래프와 새 저장소**에서 시작합니다. 첫 번째 실험을 끝낸 상태에
+입력을 더하면 비교 조건이 달라지니까요. 다시 두 노드를 한 번씩 실행하고 오른쪽을
+실패시킨 다음, 이번에는 빈 목록을 담은 dict를 보냈습니다.
+
+```python
+fresh_graph, fresh_calls, fresh_effects = make_graph()
+fresh_config = {"configurable": {"thread_id": "new-input-example"}}
+fail_once(fresh_graph, fresh_config, fresh_calls, fresh_effects)
+
+restarted = fresh_graph.invoke({"values": []}, fresh_config)
+```
+
+출력은 이랬어요.
+
+```text
+NEW_INPUT: calls={'left': 2, 'right': 2}, values=['left', 'right'], effects={'left': 2, 'right': 2}
+```
+
+최종 `values`만 보면 앞의 재개와 같습니다. 하지만 왼쪽도 두 번 실행됐어요. 이 그래프에서
+입력 dict를 보내는 호출은 `START`를 통해 두 노드를 다시 활성화했습니다. 같은
+`thread_id`를 쓰고 값도 처음과 같다고 해서 `None`으로 재개하는 호출과 같지는 않았어요.
+
+| 두 번째 호출 | 왼쪽 누적 실행 | 오른쪽 누적 실행 | 최종 결과 |
+| --- | --- | --- | --- |
+| `invoke(None, config)` | 1회 | 2회 | `['left', 'right']` |
+| `invoke({'values': []}, config)` | 2회 | 2회 | `['left', 'right']` |
+
+실패 후 이어가는 코드를 확인할 때 응답 본문만 비교하면 이 차이를 못 봅니다. 같은
+결과를 만들었어도 그 과정에서 실행한 작업은 달랐으니까요.
+
+## 체크포인트 밖에 남긴 흔적은 되돌아가지 않았어요
+
+`None`으로 제대로 재개한 첫 실험에서도 오른쪽의 `effects`는 두 개였습니다. 실패한
+첫 실행의 `append()`와 성공한 두 번째 실행의 `append()`가 모두 남았어요. reducer는
+그래프 상태를 합쳤고 checkpointer는 재개에 필요한 결과를 보존했지만, 별도의 Python
+리스트를 이전 상태로 되돌리지는 않았습니다.
+
+이 리스트는 그래프 상태 밖에서 한 작업을 구별하기 위한 관찰 장치예요. 실제 외부 API의
+중복 처리나 멱등성을 시험한 것은 아닙니다. 또 `InMemorySaver`를 사용했으므로 프로세스가
+살아 있는 동안 예외를 잡고 재개하는 범위입니다. 프로세스를 종료한 뒤의 복구까지
+확인한 결과로 읽을 수는 없어요.
+
+이 실험에서 고친 것은 병렬 결과를 합치는 상태 정의와, 실패한 실행을 이어가는 호출입니다.
+그 뒤에도 남는 반복 작업은 별도 흔적으로 확인했습니다. 재시도 문제를 볼 때는 최종
+결과가 맞는지와 어떤 작업이 몇 번 실행됐는지를 함께 확인하려고 해요. 여기서는 같은
+리스트 하나가 나오는 두 호출이 서로 다른 일을 하고 있었습니다.
+
+## 직접 실행하기
+
+[전체 코드와 검증문](/blog/examples/langgraph-supersteps.py)을 내려받은 디렉터리에서 실행합니다.
+앞에서 사용한 함수와 import가 모두 들어 있어요.
+
+```sh
+uv run --no-project langgraph-supersteps.py
+```
+
+파일에 Python 3.11 계열과 주요 패키지 세 개의 버전을 지정했습니다. 최초 실행에는
+Python과 의존성 다운로드가 필요할 수 있어요. 실행 중 모델 호출은 하지 않습니다.
+코드는 충돌, 두 가지 상태 조회, 재개와 새 입력의 차이, 상태 밖 흔적을 검사하고 마지막에
+아래 문장을 출력합니다.
+
+```text
+PASS: conflict, state views, resume, new input, effects
+```
 
 ## 참고한 자료
 
-- Malewicz 외, [Pregel: A System for Large-Scale Graph Processing](https://research.google/pubs/pub37252/) (Google, SIGMOD 2010)
-- L. Valiant, [A Bridging Model for Parallel Computation](https://dl.acm.org/doi/10.1145/79173.79181) (BSP 모델, CACM 1990)
-- LangGraph, [Low-level concepts: Pregel, super-steps, checkpointers](https://langchain-ai.github.io/langgraph/concepts/low_level/)
-- LangGraph, [Persistence & checkpointers](https://langchain-ai.github.io/langgraph/concepts/persistence/) (MemorySaver, PostgresSaver)
-
-- [Concurrent graph updates](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE) (LangGraph): 같은 단계에서 동일 키를 갱신할 때의 오류
-- [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (LangGraph): 단계별 스냅샷과 pending writes
-- [Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts) (LangGraph): 승인 대기와 Command를 이용한 재개
+- [INVALID_CONCURRENT_GRAPH_UPDATE](https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE) (LangGraph): 같은 단계에서 동일 키에 들어오는 병렬 업데이트와 reducer
+- [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (LangGraph): 체크포인트, 작업별 pending writes와 상태 조회
+- [실행 코드](/blog/examples/langgraph-supersteps.py) (이 글): 두 실험의 구성, 상태와 실행 횟수 검사

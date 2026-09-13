@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["에이전트", "설계", "관측성", "데이터베이스"]
 translationKey: "agent-memory-measured"
-draft: false
+draft: true
 ---
 
 운영 에이전트에게 기억을 붙이는 작업을 맡았어요. 지금은 컨테이너 안에 평문 파일 하나가

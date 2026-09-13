@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 tags: ["스토리지", "신뢰성", "관측성", "AWS", "설계"]
 lang: ko
 translationKey: "efs-no-ceiling-gc"
-draft: false
+draft: true
 ---
 
 앞선 글에서 스토리지를 공유 파일시스템으로 옮겼고, 옮기자마자 남은 용량이 마이너스로

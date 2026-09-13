@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["스토리지", "AWS", "Kubernetes", "아키텍처", "신뢰성"]
 translationKey: "s3-pvc-to-efs"
-draft: false
+draft: true
 ---
 
 에이전트 런타임의 데이터 디렉터리를 어디에 둘지 정해야 했어요. 지금은 블록 스토리지

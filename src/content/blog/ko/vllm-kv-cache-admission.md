@@ -3,11 +3,10 @@ title: "부하 시험 17회차가 운영 포화를 못 만든 이유"
 description: "운영 요청의 원문 없이 만든 재생 코퍼스가 캐시 재사용을 과하게 만들고 있었습니다. 부하 시험과 운영 로그의 범위를 나눠 KV 캐시 병목을 조사하고, 엔진 후보 9개 검토와 직접 시험 5개 끝에 채택을 보류한 기록입니다."
 pubDate: 2026-09-11
 updatedDate: 2026-09-13
-featuredOrder: 4
 lang: ko
 tags: ["LLM 서빙", "vLLM", "성능", "관측성", "디버깅"]
 translationKey: "vllm-kv-cache-admission"
-draft: false
+draft: true
 ---
 
 에이전트 제품의 모델을 외부 API에서 사내 서빙으로 옮긴 뒤, "언제 밀리는가"에 답할

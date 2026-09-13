@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: en
 tags: ["distributed systems", "scaling", "architecture", "AWS"]
 translationKey: "session-aware-routing"
-draft: false
+draft: true
 ---
 
 The scraping service had to log into sites and then keep working as that logged-in user.

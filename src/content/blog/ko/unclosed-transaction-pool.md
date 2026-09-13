@@ -6,7 +6,7 @@ updatedDate: 2026-09-13
 lang: ko
 tags: ["데이터베이스", "디버깅", "신뢰성", "트랜잭션"]
 translationKey: "unclosed-transaction-pool"
-draft: false
+draft: true
 ---
 
 제가 받은 버그 리포트는 좀 이상했습니다. 사용자가 값을 하나 수정하면 저장은 분명히
