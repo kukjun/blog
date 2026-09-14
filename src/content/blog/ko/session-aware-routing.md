@@ -6,6 +6,7 @@ updatedDate: 2026-09-14
 lang: ko
 tags: ["브라우저 자동화", "라우팅", "세션", "장애 처리"]
 translationKey: "session-aware-routing"
+featuredOrder: 2
 draft: false
 ---
 

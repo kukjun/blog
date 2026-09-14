@@ -6,6 +6,7 @@ updatedDate: 2026-09-14
 lang: ko
 tags: ["스토리지", "디버깅", "Bun", "Node.js"]
 translationKey: "efs-statfs-32bit"
+featuredOrder: 3
 draft: false
 ---
 

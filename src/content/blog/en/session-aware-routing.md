@@ -6,6 +6,7 @@ updatedDate: 2026-09-14
 lang: en
 tags: ["browser automation", "routing", "sessions", "failure handling"]
 translationKey: "session-aware-routing"
+featuredOrder: 2
 draft: false
 ---
 
