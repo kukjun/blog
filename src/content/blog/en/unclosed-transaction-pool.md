@@ -1,148 +1,136 @@
 ---
-title: "Saved, but the value keeps reverting: a transaction left open in the connection pool"
-description: "A value would save fine, then sometimes come back as the old one, and only 20 to 30 minutes after a restart. The story of ruling out the database, then the cache, and finally catching a cron job that returned early inside a transaction and handed a not-quite-clean connection back to the pool."
+title: "The connection returned to the pool. The transaction stayed open."
+description: "A staging bug returned different values through different connections. I revisit the original investigation, then use a real PostgreSQL server and driver to distinguish uncommitted writes, stale snapshots, and transaction cleanup."
 pubDate: 2024-04-01
+updatedDate: 2026-09-14
 lang: en
 tags: ["databases", "debugging", "reliability", "transactions"]
 translationKey: "unclosed-transaction-pool"
 draft: false
 ---
 
-The bug report I got was a strange one. A user edits a value, and it saves. That part
-works. But when they refresh, the old value is sometimes back. Same request, same code,
-yet it works some of the time and not others.
+While testing in staging, I updated a value and got different results from requests arriving at the same time. Some returned the new value; others returned the old one. Checking and disabling the query cache did not resolve it. I added logs around updates and reads to find out why the result depended on the request.
 
-What made it stranger: restarting the server fixed it, but only for about 20 to 30
-minutes, after which it slowly crept back.
+In [the original April 2024 post](https://velog.io/@imkkuk/Trouble-Shooting-%EC%A2%85%EB%A3%8C%ED%95%98%EC%A7%80-%EC%95%8A%EC%9D%80-Transaction%EC%9D%84-Connection-Pool%EB%A1%9C-%EB%B0%98%ED%99%98), I described enabling SQL logs locally and finding a cron job with an early `return` that skipped both commit and rollback. Its `finally` block returned the connection to the pool without ending the transaction.
 
-If you've spent time around production, "a restart fixes it for a while" probably makes
-something click. It usually isn't a bug in your logic. It points at a shared resource
-that accumulates state over time, and the most shared, most reused resource in a
-backend is the connection pool.
+Reading that account again, I needed to separate two questions. If only the connection that performed an update can see it, the write may still be uncommitted. If a connection cannot see a write that another connection has committed, the reader may be holding an older snapshot. Calling both symptoms “the value reverted” hides the different SQL sequences we need to examine.
 
-## Before opening any code, I read the symptoms
+## Returning a connection did not end the database transaction
 
-Lining up the three symptoms already told me roughly where to look:
+The original post did not preserve the exact MariaDB and TypeORM patch versions. For the source inspection, I therefore pinned the versions: TypeORM **0.3.26** and mysql2 **3.14.5**. `MysqlQueryRunner.release()` calls the driver connection's `release()`. The default mysql2 release path hands the connection to a waiting borrower or puts it on the idle list. It does not send `COMMIT` or `ROLLBACK`.
 
-- The same request returns different values from one call to the next.
-- An update saves, then reverts to the old value.
-- A freshly started server is fine; it only shows up 20 to 30 minutes in.
+```text
+QueryRunner.release()
+  -> databaseConnection.release()
+  -> pool.releaseConnection(connection)
+  -> waiting borrower or idle list
+```
 
-A fresh pool doesn't have a problem connection in it yet. The offending code has to run
-once, and then that connection has to get lent back out, which takes time. So some
-requests were drawing a connection that still carried leftover state from whoever used
-it last. Now I had a shape to chase.
+That is a reading of those specific versions' default implementations. Other drivers or custom release hooks may reset session state. It also does not establish which binary versions ran in 2024.
 
-## Ruling out the cheap suspects first
+To check the effect directly, I ran a separate experiment on September 14, 2026, using **PostgreSQL 18.4 and pg 8.16.3**. This is not a recreation of the MariaDB incident in its original environment. It uses a real database server and driver, a pool limited to one connection, and a separate observer connection. The one-connection pool makes the next borrower reuse the same database session.
 
-I started with the database. MariaDB was on a current version with no known issue for
-this, and when I checked who was actually connected, it was just the app and my own
-DataGrip session. Nothing odd on the server side, so I moved on.
+## When only the writer can see the update
 
-Then the cache. There was no Redis in front of it, and TypeORM's built-in query cache
-was turned off, so stale reads couldn't be a caching artifact.
-
-With those gone, what was left was how the application handled transactions. Two logs
-closed the case. First, once I had structured app logging, I caught two requests
-arriving at the same moment and getting different values: one saw the update, the other
-saw stale data. That was the tell. The data wasn't wrong, different connections were
-simply seeing different things. Then I turned on SQL logging and there it was, a
-`START TRANSACTION` with no matching commit or rollback.
-
-## The real cause: a plain `return` inside a transaction
-
-A cron job was opening a transaction and then returning early on one branch, before it
-ever committed.
+Start with the value 200. The first borrower sends `BEGIN` and returns the connection without ending the transaction. The next borrower performs a normal update without explicitly starting a transaction.
 
 ```javascript
-async badCode() {
-  const connection = getConnection();
+const first = await pool.connect();
+await first.query('BEGIN');
+first.release(); // Deliberate omission in the experiment.
+
+const next = await pool.connect();
+await next.query('UPDATE pool_value SET value = 300 WHERE id = 1');
+```
+
+It is a new request to the application, but the database still sees the open transaction on the same connection. That connection read its own uncommitted write and returned 300. The separate observer returned 200. After `next` sent `ROLLBACK`, both connections read 200.
+
+| Step | Reused connection | Separate connection |
+| --- | --- | --- |
+| Update to 300 inside the inherited transaction | 300 | 200 |
+| Send `ROLLBACK` on that connection | 200 | 200 |
+
+Seeing 300 in a query result did not prove that the write had committed. Repeatedly borrowing the writer's connection can make the update look saved, while borrowing another connection can make it look absent. The point where an update request reports success needs to be checked against the point where the database confirms the commit.
+
+## When the write committed but the reader still sees the old value
+
+Next, I left an old snapshot on the reader. It read the initial value 100 inside a `REPEATABLE READ` transaction and returned the connection without ending that transaction. The observer updated the value to 200 and committed. Then I borrowed the pooled connection again.
+
+```javascript
+const first = await pool.connect();
+await first.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+await first.query('SELECT value FROM pool_value WHERE id = 1');
+first.release();
+
+await observer.query('UPDATE pool_value SET value = 200 WHERE id = 1');
+const next = await pool.connect();
+const result = await next.query('SELECT value FROM pool_value WHERE id = 1');
+```
+
+I compared `pg_backend_pid()` before release and after borrowing again to confirm that both borrowers used the same database session. The new borrower read 100; the observer read 200. After the reader ended its existing transaction with `ROLLBACK`, it read 200 too.
+
+| Check | Observed result |
+| --- | --- |
+| Database session before and after release | Same session |
+| Read through the reused connection | 100 |
+| Read through the separate connection | 200 |
+| Read through the reused connection after rollback | 200 |
+
+In the previous experiment, the write was uncommitted. Here, it had already committed. Different simultaneous query results alone cannot distinguish them. We need to connect the transaction start and first read on one session with the write and commit on the other. PostgreSQL's `REPEATABLE READ` retains a transaction snapshot; its default `READ COMMITTED` obtains a new snapshot for each command. This experiment explicitly selected the former.
+
+## Put cleanup around the callback
+
+The original post says I added the missing transaction cleanup and checked rollback logs in local and development environments. For this new experiment, I wrapped the work in a function that ends the transaction whether the callback returns early or throws.
+
+```javascript
+async function withTransaction(work) {
+  const client = await pool.connect();
+  let discard = false;
   try {
-    await connection.startTransaction();
-    // ...business logic...
-    if (A === true) {
-      return A;                       // leaves here with no commit and no rollback
+    await client.query('BEGIN');
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      discard = true;
+      throw new AggregateError([error, rollbackError], 'Transaction cleanup failed');
     }
-    await connection.commitTransaction();
-    return dto;
-  } catch (e) {
-    await connection.rollbackTransaction();
+    throw error;
   } finally {
-    await connection.release();       // released, but the transaction is still open
+    client.release(discard);
   }
 }
 ```
 
-This is the tricky bit. The `finally` does release the connection, so it looks tidy.
-But the early return skipped both the commit and the rollback, so the connection goes
-back to the pool with its transaction still open. It's returned, just not clean.
+Using the same driver, a callback updated the value to 400 and immediately returned. The separate connection then read 400. Another callback updated it to 500 and deliberately threw an exception; the separate connection still read 400. This checked commit on a normal return and rollback on an exception. All work used the `client` passed into the callback.
 
-Here's why that surfaces as stale reads. Under MySQL and MariaDB's default REPEATABLE
-READ, a transaction takes a consistent snapshot at its first read and keeps serving that
-same snapshot until it ends. So a connection frozen mid-transaction keeps showing an old
-view of the world to whoever borrows it next.
+The code also discards the connection with `release(true)` if rollback itself fails. I did not inject a network failure or a lost commit response in this experiment. It does not establish the final outcome of such a commit or make retrying the business operation safe.
 
-```mermaid
-sequenceDiagram
-  participant Cron as Cron job
-  participant Pool as Connection pool
-  participant User as Later request
-  Cron->>Pool: START TRANSACTION, then a plain return
-  Note over Pool: returned but not clean<br/>(open transaction, frozen snapshot)
-  User->>Pool: can I borrow a connection?
-  Pool-->>User: hands over that exact one
-  User->>User: reads the frozen old snapshot<br/>the update looks reverted
+## Correcting the original explanation
+
+The original post said that sending `START TRANSACTION` again rolls back the previous transaction. MariaDB and MySQL document an **implicit commit** of the existing transaction instead. That sentence cannot explain why a value disappeared in the original incident. Starting a new transaction is not a cleanup strategy: it could commit a previous borrower's unintended write.
+
+I am not transferring every command's behavior from the PostgreSQL experiment to MariaDB either. The question they help examine is where the request ends, where the connection returns to the pool, and where the database transaction ends. When an update appears inconsistent, tracing the start, first read, write, and cleanup of each database session gives us more to work with than comparing values alone.
+
+## Run the experiment
+
+The [complete reproduction](/blog/examples/database-transactions.mjs) starts a temporary PostgreSQL server on a private Unix socket, then stops it and removes its data. It does not connect to an existing database or open a TCP port. I ran it with Node.js 24.15.0 on macOS arm64. The `pool` section of its output contains the results discussed here.
+
+```bash
+work="$(mktemp -d)"
+npm install --prefix "$work" embedded-postgres@18.4.0-beta.17 pg@8.16.3
+BLOG_DB_NODE_MODULES="$work/node_modules" node public/examples/database-transactions.mjs
 ```
 
-Seen this way, all three symptoms line up at once. The result depends on which
-connection you draw, so it's inconsistent. The frozen snapshot predates the write, so
-the value looks reverted. And the cron has to run and its connection has to get re-lent,
-so it only appears once the server has been up a while.
-
-## The fix was simple. The habit behind it mattered more.
-
-I changed it so every path commits or rolls back before the connection is released.
-
-```javascript
-async goodCode() {
-  const connection = getConnection();
-  try {
-    await connection.startTransaction();
-    const dto = A === true
-      ? await handleA(connection)
-      : await handleNonA(connection);   // decide the branch inside the try
-    await connection.commitTransaction();
-    return dto;
-  } catch (e) {
-    await connection.rollbackTransaction();
-    throw e;
-  } finally {
-    await connection.release();          // now it's always a clean connection
-  }
-}
-```
-
-Commit in `try`, roll back in `catch`, release in `finally`. That was the immediate fix.
-But the longer-lasting one was to stop managing transaction boundaries by hand at all.
-If you wrap them in a `typeorm-transactional` decorator or a `withTransaction(fn)`
-helper, there's no branch you can leave through that skips the commit or rollback. And
-inside a raw transaction block, it's better not to branch or return partway. If you need
-a branch, settle it before you open the transaction.
-
-One more thing worth saying: the only reason I caught this was the logs. If they hadn't
-shown two same-moment requests getting different values, this could have hidden for
-weeks. Ever since, I keep structured logging on in staging and production as a matter of
-habit.
-
-Looking back, what made this bug so annoying was that the code that caused it (a cron
-job) and the place the symptom showed up (user requests) had nothing to do with each
-other. When one transaction leaks, the blast radius isn't that code, it's the whole
-pool. It was a good reminder that building something you can't forget beats trying hard
-to remember.
+If you downloaded the example separately, replace the final file path with its location. The runtime needs permission to use shared memory. The script prints the server and driver versions alongside its observations so you can check them when running it elsewhere.
 
 ## References
 
-- [Consistent Nonlocking Reads](https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html) (MySQL): how REPEATABLE READ snapshots work
-- [SET TRANSACTION ISOLATION LEVEL](https://mariadb.com/kb/en/set-transaction/) (MariaDB)
-- [Transactions & QueryRunner](https://typeorm.io/transactions) (TypeORM)
-- [typeorm-transactional](https://github.com/Aliheym/typeorm-transactional): declarative transaction boundaries
+- [MysqlQueryRunner 0.3.26](https://github.com/typeorm/typeorm/blob/0.3.26/src/driver/mysql/MysqlQueryRunner.ts) (TypeORM): separate release and transaction-completion methods
+- [PoolConnection 3.14.5](https://github.com/sidorares/node-mysql2/blob/v3.14.5/lib/base/pool_connection.js), [Pool 3.14.5](https://github.com/sidorares/node-mysql2/blob/v3.14.5/lib/base/pool.js) (mysql2): the default connection release path
+- [Transactions](https://node-postgres.com/features/transactions) (node-postgres): using the same client to begin, query, and complete a transaction
+- [Transaction Isolation](https://www.postgresql.org/docs/18/transaction-iso.html) (PostgreSQL 18): read isolation and snapshot lifetime
+- [START TRANSACTION](https://mariadb.com/docs/server/reference/sql-statements/transactions/start-transaction) (MariaDB), [Implicit Commit](https://dev.mysql.com/doc/refman/8.0/en/implicit-commit.html) (MySQL 8.0): what starting another transaction does to the current one

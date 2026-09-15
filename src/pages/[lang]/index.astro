@@ -12,10 +12,25 @@ export async function getStaticPaths() {
 const lang = Astro.params.lang as Lang;
 const tr = t(lang);
 
-const all = await getCollection('blog', ({ data }) => !data.draft && data.lang === lang);
-const posts = all.sort(
+const all = await getCollection('blog', ({ data }) => !data.draft);
+const posts = all.filter((post) => post.data.lang === lang).sort(
   (a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf(),
 );
+
+// A selection belongs to a topic, so a missing translation must not hide it.
+const featuredOrder = new Map<string, number>();
+for (const { data } of all) {
+  if (data.featuredOrder !== undefined) {
+    const current = featuredOrder.get(data.translationKey) ?? Infinity;
+    featuredOrder.set(data.translationKey, Math.min(current, data.featuredOrder));
+  }
+}
+const featuredPosts = [...featuredOrder]
+  .sort(([a, orderA], [b, orderB]) => orderA - orderB || a.localeCompare(b))
+  .map(([key]) =>
+    all.find(({ data }) => data.translationKey === key && data.lang === lang)
+    ?? all.find(({ data }) => data.translationKey === key)!,
+  );
 ---
 <BaseLayout lang={lang} title={`${IDENTITY.displayName} | ${tr.role}`} description={tr.tagline}>
   <p class="eyebrow">{tr.role}</p>
@@ -23,7 +38,26 @@ const posts = all.sort(
   <p class="lead">{tr.bio}</p>
   <div style="margin-top:18px;"><Contact /></div>
 
-  <h2 style="font-family:var(--font-mono);font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);margin:44px 0 0;">{tr.posts}</h2>
+  {featuredPosts.length > 0 && (
+    <section aria-labelledby="featured-heading">
+      <h2 id="featured-heading" class="list-heading">{tr.featured}</h2>
+      <p class="desc">{tr.featuredIntro}</p>
+      <ul class="postlist featured-list">
+        {featuredPosts.map((post) => {
+          const target = parseId(post.id);
+          return (
+            <li>
+              {target.lang !== lang && <span class="language-note">{tr.languageNames[target.lang]}</span>}
+              <a class="title" lang={target.lang} href={withBase(`/${target.lang}/blog/${target.slug}/`)}>{post.data.title}</a>
+              <p class="desc" lang={target.lang}>{post.data.description}</p>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  )}
+
+  <h2 class="list-heading">{tr.posts}</h2>
 
   {posts.length === 0 ? (
     <p class="desc">{tr.noPosts}</p>

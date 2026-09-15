@@ -1,110 +1,230 @@
 ---
-title: "Scaling a stateful service: when the state can't move, route to it"
-description: "A scraping service held live login sessions in memory. It worked beautifully on one server, then we scaled out and it broke. The story of a dead end (centralizing the browser) and the fix: externalize not the session, but its location."
+title: "I logged in on A. The next request went to B."
+description: "Follow-up scraping needed the logged-in browser, but the request reached another server. Two workers owning real Pages show what routing preserves and why an address mapping does not recover browser state."
 pubDate: 2025-08-20
+updatedDate: 2026-09-14
 lang: en
-tags: ["distributed systems", "scaling", "architecture", "AWS"]
+tags: ["browser automation", "routing", "sessions", "failure handling"]
 translationKey: "session-aware-routing"
+featuredOrder: 2
 draft: false
 ---
 
-The scraping service had to log into sites and then keep working as that logged-in user.
-A single job was a sequence of requests sharing one authenticated browser session.
+Logging in and collecting data didn't fit into a single request in the scraping service.
+The first request logged into the site, the next read the dashboard, and another collected
+more detail. Those later requests needed to use the browser that had already logged in.
 
-1. Request 1, log in to the target site.
-2. Request 2, scrape the dashboard on that logged-in session.
-3. Request 3, pull more detail on the same session.
+With one server, I could find the browser that server held. As the number of customers
+grew and we added servers, a request could reach a different server. If login happened on A
+but the next request went to B, B had no browser with which to continue the work. That was
+the problem I described in [the original post on August 20, 2025](https://velog.io/@imkkuk/Stateful-%EC%84%9C%EB%B2%84-%ED%99%95%EC%9E%A5%ED%95%98%EA%B8%B0Session-Aware-Routing%EC%9C%BC%EB%A1%9C-%EB%B8%8C%EB%9D%BC%EC%9A%B0%EC%A0%80-%EC%84%B8%EC%85%98-%EC%9D%BC%EA%B4%80%EC%84%B1-%EC%9C%A0%EC%A7%80%ED%95%98%EA%B8%B0).
 
-On one server this was effortless. The browser session lived in memory, and every
-request found it. Then traffic grew, we put the service behind a load balancer, added a
-second server, and it broke right away. Request 2 landed on a machine that had never
-logged in, so the session simply wasn't there.
+The approach I chose then was to use the session ID to route requests to the server that
+owned the browser. This time, I used real browsers to check what that choice solves and
+where it stops helping. After starting work on a logged-in page, I sent requests to the
+wrong worker and to the owner, then tested mapping expiry and owner shutdown separately.
 
-That's the moment the textbook advice, "just make your servers stateless," stopped being
-useful. My state was a live browser holding a login I couldn't cheaply serialize and
-hand to another machine. The real requirement was uncomfortable but clear: a given
-user's requests must always reach the same server. That's the definition of a stateful
-service, and it's exactly what statelessness advice assumes away.
+The results below come from an independent local experiment on September 14, 2026, using
+Node 24.15.0, Playwright 1.56.1, and Chromium 141.0.7390.37. The target site and login are
+mock services created for the example. This does not reproduce the company's system or
+its historical operational logs.
 
-## The dead end I walked into first
+## The same session ID doesn't create the same browser
 
-My first instinct was to copy the database pattern. If every server can reach one shared
-database, why not one shared browser? Put Playwright behind its own server, let any
-scraper connect to it, and the session-sharing problem disappears.
+The [complete script](/blog/examples/browser-session-routing.mjs) starts A and B as separate
+Node processes. Each worker runs its own headless Chromium and creates a temporary
+`BrowserContext` and `Page` for each session. It doesn't use a user browser or an existing
+profile.
 
-It half-worked, and the half that failed taught me the most.
+When A receives a request to start a job, it performs these steps on a real page.
 
-Splitting Playwright into its own tier did help. It saved network resources and cleaned
-up the architecture. But it did not let two servers share a session, because Playwright
-only gives you two ways in, and neither does what I wanted.
+```javascript
+const page = await context.newPage();
+await page.goto(`${targetUrl}/login`);
+await page.getByRole('button', { name: 'Sign in as demo' }).click();
+await page.waitForURL(`${targetUrl}/workspace`);
+await page.getByRole('textbox', { name: 'Report draft' }).fill(input.draft);
+const sessionId = randomUUID();
+sessions.set(sessionId, { context, page });
+```
 
-- WebSocket spins up its own independent browser per connection, so there's no sharing.
-- CDP (Chrome DevTools Protocol) lets you attach to a specific browser by port, but at
-  hundreds of live browsers, managing those ports becomes its own distributed systems
-  problem. I'd just moved the mess, not removed it.
+The mock site issues a cookie when the login button is clicked. It shows the signed-in
+heading and input field only when that cookie is used to access the workspace.
+`July report, step 2` is a draft that hasn't been submitted. Neither the target server
+nor the router stores it. It remains **an input value in the open Page**.
 
-So I abandoned the shared-browser idea and kept the architectural split. A dead end that
-eliminates an option is still progress. It told me the session was inherently pinned to
-a server, and I should stop fighting that.
+I needed to distinguish three things that are easy to call a session.
 
-## The fix: externalize the location, not the session
+| What it is | What it does in this experiment |
+| --- | --- |
+| Login on the target site | The site checks a cookie before allowing access to the workspace |
+| A worker's job session | Stores real `context` and `page` objects under a session ID |
+| Routing mapping | Stores the worker name and expiry time for that session ID |
 
-If you can't move the session, route to it. Let each server own its own browser
-sessions, keep a central map of which server holds which session, and have a router read
-that map and forward each request to the right place.
+The client sends the job session ID with each follow-up request. Passing that string
+doesn't create A's `Page` object in B. Being logged in as the same account doesn't recreate
+the unfinished input in the currently open page, either.
+
+The original post said that each Playwright WebSocket connection creates an independent
+browser. That was not a general API restriction. [`browserType.connect()`](https://playwright.dev/docs/api/class-browsertype#browser-type-connect)
+can connect to an existing browser, and Playwright also supports
+[saving authentication state and reusing it in a new context](https://playwright.dev/docs/auth).
+The condition in this experiment is **a worker owning its Page and executing follow-up
+work on it**. It isn't a claim that browsers cannot be shared.
+
+## B couldn't find the page. A read the unfinished draft.
+
+I first created a session on A, then sent the same ID directly to B. B couldn't find it
+in its own session collection and returned `404 SESSION_NOT_OWNED`.
+
+```javascript
+const session = sessions.get(id);
+if (!session) return { status: 404, body: { error: 'SESSION_NOT_OWNED', worker: name } };
+```
+
+That check matters because the next operation isn't a string or database record lookup.
+The worker reads the signed-in heading and input value from the real `Page` it holds.
+
+```javascript
+authenticated: await session.page.getByRole('heading', { name: 'Signed in as demo' }).isVisible(),
+page: new URL(session.page.url()).pathname,
+draft: await session.page.getByRole('textbox', { name: 'Report draft' }).inputValue(),
+```
+
+After the request to B failed, I sent the same ID to the router. It found the owner, A,
+recorded when the session was created, and forwarded the HTTP request to that worker.
 
 ```mermaid
-flowchart TD
-  C["client, request carries a session id"] --> ALB["ALB"]
-  ALB --> R["Lambda router"]
-  R <-->|"look up session, find server"| K["ElastiCache (Redis)<br/>session-to-server map, with TTL"]
-  R -->|"route to the owner"| S1["EC2 scraper A<br/>owns sessions 1, 3"]
-  R -.->|"or"| S2["EC2 scraper B<br/>owns sessions 2, 4"]
+flowchart LR
+  C["Follow-up request<br/>Job session ID"] --> R["Router<br/>Look up owner and expiry"]
+  R --> A["Worker A"]
+  A --> P["Context and Page owned by A<br/>Logged in, unfinished draft"]
+  C -. "Wrong destination" .-> B["Worker B<br/>No matching Page"]
 ```
-<span class="figcap">Session 1 was born on scraper A, so every follow-up request for session 1 gets routed back to A, where its browser actually lives.</span>
 
-Three principles held the design together. First, I externalized the location, not the
-session: the map lives in Redis, while the heavy, un-serializable browser state stays
-exactly where it is. Second, I routed on identity: the first request creates the mapping
-(with a TTL), and every later request carries the session id, so the router looks up its
-owner before forwarding. Third, I planned for failure: a server dying means its sessions
-are gone, so the system detects that and fails cleanly instead of routing into a void.
+<span class="figcap">The destination of the request changed. The router didn't copy browser state or perform the browser work itself.</span>
 
-## Say the trade-offs out loud
+These were the outputs from the two paths. The status codes are response choices made
+for this example.
 
-Every clever routing design buys a new failure surface. Here's the honest ledger.
+```text
+WRONG_WORKER: 404 SESSION_NOT_OWNED
+OWNER: 200 authenticated=true draft="July report, step 2"
+```
 
-| New risk it introduces | How I mitigated it |
-|---|---|
-| Redis is now a single point of failure | Multi-AZ ElastiCache |
-| A server dies and its sessions are lost | Client-side retry that starts a fresh session |
-| The Lambda routing hop adds cold-start latency | Provisioned concurrency |
+The draft A returned wasn't a string cached in the router. It came from calling
+`inputValue()` on the page opened after login. This checked both that the ID led to the
+right owner and that the follow-up request reached the browser work already in progress.
 
-None of these are free. The design is only worth it because the alternative, serializing
-a live browser session on every hop, is worse. Writing the failure modes down next to
-the diagram is how you keep an architecture honest.
+## The page was still alive after the mapping expired
 
-## The pattern generalizes
+The routing mapping contains no browser state. Its contents look like this.
 
-This was never really about scraping. The same shape shows up whenever state is
-expensive to move. In WebSocket fan-out (chat, game servers) the connection lives on one
-node; in chunked file uploads the in-progress upload lives where it started; in
-state-machine workflows the machine's memory is pinned to a worker.
+```javascript
+{ worker: 'A', expiresAt: Date.now() + ttlMs }
+```
 
-The reusable idea is to define the state's lifecycle, externalize its location, and make
-routing follow it. Sticky sessions is the well-known cousin, and this is the same
-instinct for when the stickiness can't be delegated to the load balancer alone.
+The router checks expiry before selecting the owner. When the mapping is missing or
+expired, this example fails the follow-up request instead of choosing another server
+arbitrarily.
 
-Looking back, three things stuck with me. "Make it stateless" is a goal, not a law, so
-it's better to name the genuinely sticky state and design for it than to pretend it
-isn't there. You externalize the cheap thing, a pointer, not the expensive thing, the
-session. And a design's real cost is its new failure modes; I met all three of mine
-eventually, and the only reason they never became incidents is that they were on the
-diagram from day one.
+```javascript
+if (!owner) return json(res, 404, { error: 'MAPPING_MISSING' });
+if (owner.expiresAt <= Date.now()) return json(res, 410, { error: 'MAPPING_EXPIRED' });
+destination = workers[owner.worker];
+```
+
+For the test, I gave a second session's mapping a TTL of 50ms and waited 75ms. Requests
+through the router returned `410`, but querying A directly still read the draft from the
+same Page.
+
+```text
+EXPIRED_MAPPING: 410 MAPPING_EXPIRED; owner still reads the live Page
+```
+
+**The mapping's validity and the browser's lifetime were separate.** Expiring the mapping
+didn't automatically clean up the browser. A service needs an additional session cleanup
+rule to coordinate the two lifetimes. This experiment didn't implement that cleanup;
+it showed that the lifetimes don't align automatically.
+
+Here, a local Map stores the expiry time. This doesn't test Redis TTL deletion, replication
+lag, or failover. The control page's expiry button moves the deadline into the past.
+The automated test actually waits, then checks the same expiry condition.
+
+## Pointing the address at B didn't recover the work
+
+Next, I closed A's browser and stopped A's HTTP server and process. I left the first
+session's mapping pointing at A. The follow-up request failed because its owner could
+no longer be reached.
+
+What if I changed only the mapping to point at B? B was a server that could respond,
+but it didn't have the original session's `Page`.
+
+```text
+STOPPED_OWNER: 502 OWNER_UNAVAILABLE
+REMAPPED_TO_B: 404 SESSION_NOT_OWNED
+```
+
+A connection failure became a missing-session response. The interrupted work didn't
+continue. An address mapping doesn't contain the logged-in context, the open page, or
+the unfinished input.
+
+Finally, I logged in on B using the same mock account. Login succeeded, but the new
+workspace's input field was empty, and a new job session ID was created.
+
+```text
+NEW_LOGIN_ON_B: 201 authenticated=true draft=""; new session
+```
+
+Logging in again made it possible to start a new job. It didn't recover the unfinished
+draft. I deliberately kept that draft only in the page. Recovery could work differently
+if the target service saved drafts on its server or if the necessary work state were
+preserved separately.
+
+## What this experiment establishes
+
+The change in this experiment was the destination of a follow-up request. Going through
+the router reached A's Page, where the login and draft remained. Mapping expiry didn't
+delete the live Page, and changing an address after shutting down its owner didn't bring
+that Page back.
+
+The shutdown was controlled: the worker also cleaned up its browser. I didn't test host
+failure, browser processes left behind after a forced shutdown, or recovery after a
+restart. Ordering and conflicts when two requests manipulate the same Page concurrently
+are also outside this test.
+
+Returning to the original problem, a session ID alone didn't let the next collection
+request continue. It also had to connect to the browser's location and the worker that
+would perform the operation. Routing solved that connection. Recreating browser work
+that was already lost needed a separate approach to preserving state and restarting work.
+
+## Run it yourself
+
+Download the [script](/blog/examples/browser-session-routing.mjs) into an empty directory
+and run these commands. They install dependencies for the example; Chromium needs to be
+downloaded on the first run.
+
+```sh
+npm install --save-exact playwright@1.56.1
+npx playwright install chromium
+node browser-session-routing.mjs --self-test
+```
+
+The automated checks call the actual worker APIs and assert browser values and response
+codes. When finished, the script cleans up its servers and browsers and prints:
+
+```text
+PASS: browser ownership, routing, mapping expiry, owner stop, address-only remap, new login
+```
+
+Run it without `--self-test` to open the controls at `http://127.0.0.1:47320`. Buttons send
+the same requests for session creation, the wrong worker, owner routing, expiry, shutdown,
+and remapping. Every server binds only to the loopback address.
 
 ## References
 
-- AWS, [Application Load Balancer: sticky sessions](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/sticky-sessions.html)
-- AWS, [Amazon ElastiCache for Redis](https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/WhatIs.html)
-- M. Kleppmann, [Designing Data-Intensive Applications](https://dataintensive.net/) (Ch. 6, partitioning and request routing)
-- Playwright, [Browser & CDP connection model](https://playwright.dev/docs/api/class-browsertype)
+- [Scaling a stateful server](https://velog.io/@imkkuk/Stateful-%EC%84%9C%EB%B2%84-%ED%99%95%EC%9E%A5%ED%95%98%EA%B8%B0Session-Aware-Routing%EC%9C%BC%EB%A1%9C-%EB%B8%8C%EB%9D%BC%EC%9A%B0%EC%A0%80-%EC%84%B8%EC%85%98-%EC%9D%BC%EA%B4%80%EC%84%B1-%EC%9C%A0%EC%A7%80%ED%95%98%EA%B8%B0) (original post, August 20, 2025): the need for follow-up requests to share a logged-in session when adding servers
+- [BrowserType.connect](https://playwright.dev/docs/api/class-browsertype#browser-type-connect) (Playwright): connecting to an existing browser
+- [BrowserContext](https://playwright.dev/docs/api/class-browsercontext) (Playwright): independent browser sessions and Pages within a context
+- [Authentication](https://playwright.dev/docs/auth) (Playwright): saving authentication state and reusing it in a new context
+- [Executable script](/blog/examples/browser-session-routing.mjs) (this post): workers owning real browsers, the router, and boundary checks
